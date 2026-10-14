@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>사물 · 물성 · 지각 · 감성 랩 v8</title>
+  <title>사물 · 물성 · 지각 · 감성 랩 v4</title>
 
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
@@ -39,6 +39,8 @@
     body .t-label   { font-size: 16px; font-weight: 800; letter-spacing: 0.04em; }
 
     body .prose-ko { text-align: left; white-space: pre-line; }
+    /* 로딩·오류 안내처럼 가운데 정렬해야 하는 문구 */
+    body .prose-center { text-align: center; white-space: pre-line; }
 
     .no-scrollbar::-webkit-scrollbar { display: none; }
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
@@ -94,7 +96,8 @@
       /* =========================================================
          1. CONFIG / 상수
          모델은 GPT-5.6 Terra(분석)와 Image 2.5 Flare(이미지)로 고정합니다.
-         저장 데이터 구조가 v1(선택형)과 달라 저장 키를 v2로 분리합니다.
+         프로젝트와 이미지는 모두 IndexedDB에 저장합니다.
+         (예전 버전이 localStorage에 남긴 프로젝트는 처음 실행할 때 옮겨 옵니다.)
          ========================================================= */
       const CONFIG = {
         API_BASE: "https://api.openai.com/v1",
@@ -105,10 +108,11 @@
         SESSION_KEY_API: "cmf_reverse_openai_key_v2",
         SESSION_KEY_PREFS: "cmf_reverse_prefs_v2",
         PROJECTS_KEY: "cmf_reverse_projects_v2",
-        IMAGE_DB: { name: "cmf_reverse_images_v2", store: "images" },
+        DB: { name: "cmf_reverse_images_v2", version: 2, images: "images", projects: "projects" },
         MAX_PROJECTS: 5,
         AUTOSAVE_MS: 5000,
         IMAGE_SIZE: "1024x1536",
+        IMAGE_STORE_QUALITY: 0.9,
         PHOTO_MAX_EDGE: 1280,
         PHOTO_QUALITY: 0.86
       };
@@ -165,7 +169,7 @@
 
       /* =========================================================
          2. PROMPTS — 텍스트
-         사물 → 전체 특징 → 물성 → 지각 → 감성 → 감성 키워드
+         사물 → 전체 특징 → 물성 → 지각 → 감성
          고정된 CMF 프레임이나 고정 개수에 맞추지 않고 사물 자체에 필요한 항목을 AI가 정합니다.
          각 항목은 앞 단계 항목 번호(from)를 근거로 돌려받아 추적 경로를 보여 줍니다.
          ========================================================= */
@@ -187,6 +191,8 @@
         `${p.index}. [${p.axis}] ${p.titleKo} (${p.titleEn}) · 추정 ${p.level} ${p.value} — ${p.description}`).join("\n");
       const listPerceptions = items => items.map(p =>
         `${p.index}. [${p.moment}] ${p.titleKo} (${p.titleEn}) — ${p.description}`).join("\n");
+      const listEmotions = items => items.map(l =>
+        `${l.index}. [${l.phase}] ${l.nameKo} (${l.nameEn}) · 강도 ${l.intensity} — ${l.description}`).join("\n");
       const objectHead = o => `분석 사물: ${o.nameKo}${o.nameEn ? ` (${o.nameEn})` : ""} · ${o.kind}\n기준 표본: ${o.specimen || o.summary}`;
 
       const PROMPTS = {
@@ -358,41 +364,45 @@ ${EMOTION_METHOD.guide}
 - 지나치게 시적이거나 광고 카피처럼 쓰지 않습니다.
 ${instruction ? `\n[추가 지시사항]\n${instruction}\n` : ""}
 [FORMAT] 정확히 이 JSON만 반환하세요:
-{"emotion":{"nameKo":"","nameEn":"","summary":"3~4문장","moodWords":[""],"trace":"2문장","emotions":[{"category":"에너지","nameKo":"","nameEn":"","description":"2문장","from":[1],"intensity":70,"visual":"english single-scene mood prompt","label":"","labelKo":"","style":"Soft 3D Illustration"}]}}`,
-
+{"emotion":{"nameKo":"","nameEn":"","summary":"3~4문장","moodWords":[""],"trace":"2문장","emotions":[{"category":"에너지","nameKo":"","nameEn":"","description":"2문장","from":[1],"intensity":70,"visual":"english single-scene mood prompt","label":"","labelKo":"","style":"Soft 3D Illustration"}]}}`
       };
 
-      /* 개별 항목 수정 — 같은 단계 프롬프트의 규칙과 맥락을 그대로 쓰되,
-         선택한 항목 하나만 돌려받습니다. 다른 항목은 코드에서 손대지 않습니다. */
-      function itemEditPrompt(basePrompt, stageLabel, others, target, raw, instruction) {
-        return `${basePrompt}
+      /* ---------------------------------------------------------
+         2-B. 항목 하나만 수정할 때 덧붙이는 지시
+         단계 프롬프트 전체(작성 규칙)를 그대로 쓰고, 끝에 '부분 수정 모드'를 덧붙여
+         선택한 항목 하나만 돌려받습니다. 나머지 항목은 화면과 저장 데이터에서 그대로 유지됩니다.
+         --------------------------------------------------------- */
+      const EDIT_FORMAT = {
+        property: `{"item":{"axis":"역학","titleKo":"","titleEn":"","description":"2문장","from":[1],"measure":"1문장","value":50,"level":"중간","visual":"english editorial image sentence"}}`,
+        perception: `{"item":{"moment":"접촉","situation":"1문장","titleKo":"","titleEn":"","description":"2문장","from":[1],"cue":"1문장","visual":"english single-scene prompt","label":"","labelKo":"","style":"Lifestyle Photography"}}`,
+        emotion: `{"item":{"category":"에너지","nameKo":"","nameEn":"","description":"2문장","from":[1],"intensity":70,"visual":"english single-scene mood prompt","label":"","labelKo":"","style":"Soft 3D Illustration"}}`
+      };
 
-==================================================
-[중요 — 개별 항목 수정 모드: 위의 FORMAT 대신 아래 지시와 형식을 따릅니다]
-지금은 ${stageLabel} 결과 전체를 새로 만드는 것이 아니라, 이미 확정된 결과 중 ${pad2(target.index)}번 항목 하나만 다시 작성합니다.
+      function singleEditBlock(kindLabel, currentList, idx, instruction, format) {
+        const n = pad2(idx);
+        return `
 
-[현재 확정된 다른 항목 — 수정하지 않으며 겹치지 않도록 참고만 합니다]
-${others || "(없음)"}
+[부분 수정 모드 — 아래 지시가 위의 선정 원칙, 개수 규칙, FORMAT보다 우선합니다]
+현재 확정된 ${kindLabel} 결과 전체:
+${currentList}
 
-[수정 대상 ${pad2(target.index)}번 항목의 현재 내용]
-${JSON.stringify(raw, null, 1)}
+위 목록 중 ${n}번 항목 하나만 다시 작성합니다.
+- 나머지 항목은 이미 확정되었으므로 바꾸지 않고, 응답에 포함하지도 않습니다.
+- 새 ${n}번 항목은 다른 항목과 의미가 겹치지 않아야 하며, 위의 작성 규칙(필드 의미, 언어 규칙, 근거 번호 from)을 그대로 따릅니다.
+- 수정 지시: ${instruction || "이 항목을 다른 항목과 겹치지 않게, 근거가 더 분명하고 구체적이도록 다시 작성해 주세요."}
 
-[수정 지시]
-${instruction || "같은 역할을 유지하면서 내용을 더 정확하고 구체적으로 다시 작성해 주세요."}
-
-[규칙]
-- 수정 대상 항목 하나만 다시 작성합니다. 다른 항목과 의미가 겹치지 않게 합니다.
-- 위 단계의 작성 규칙(필드 의미, 언어 규칙, 스타일 목록, from 번호 규칙)은 그대로 지킵니다.
-- 정확히 {"item":{...}} 형태의 JSON 하나만 반환합니다. item의 필드 구성은 위 FORMAT 배열의 원소 하나와 같습니다.`;
+[FORMAT] 정확히 이 JSON만 반환하세요:
+${format}`;
       }
 
       /* =========================================================
-         3. 이미지 — 항목별 이미지 + 앱이 직접 그리는 통합 보드
-         항목마다 이미지를 따로 만들고 보드는 앱이 캔버스로 배치합니다.
-         그래서 한 항목만 수정해도 나머지 칸은 그대로 유지되고,
-         라벨은 앱이 직접 쓰므로 한글이 깨지거나 작아지지 않습니다.
+         3. PROMPTS — 통합 이미지
+         단계마다 여러 장면을 한 장으로 묶어 생성 비용을 줄입니다.
+         항목 하나만 수정할 때는 기존 통합 이미지를 편집해 해당 칸만 바꿉니다.
          ========================================================= */
-      const IMG_BASE = `Editorial imagery for a high-end design magazine. Premium image quality, professional lighting, convincing material and atmospheric detail where appropriate, natural tonal depth. Avoid conventional posed portraits and identifiable faces; hands, back views or partial figures are fine when a scene genuinely needs a person. Absolutely no text, letters, numbers, captions, labels, watermark, logo or signature anywhere in the image.`;
+      const IMG_BASE = `Editorial imagery for a high-end design magazine. Premium image quality, professional lighting, convincing material and atmospheric detail where appropriate, natural tonal depth, no watermark, no logo, no signature. Preserve the chosen style faithfully rather than forcing every panel to look equally sharp. Avoid conventional posed portraits and identifiable faces; hands, back views or partial figures are fine when a scene genuinely needs a person.`;
+
+      const IMG_LABEL_RULE = `Label typography, applied to every numbered label in the image: set each label on its own clean white caption strip, with the leading number in bold and the Korean title followed immediately by the English title on the SAME LINE in regular weight, in a neutral sans-serif on white. Do not place English on a second line. The label text must be large and unmistakably legible — letters at least 40 pixels tall in this 1024 x 1536 image. Never set label text smaller than that; if space is tight make the caption strip taller rather than shrinking the type. Render only the label text specified below and no other lettering anywhere in the image.`;
 
       const pad2 = n => String(n).padStart(2, "0");
       const q = s => String(s || "").replace(/"/g, "'");
@@ -401,213 +411,108 @@ ${instruction || "같은 역할을 유지하면서 내용을 더 정확하고 �
         const name = item && IMAGE_STYLES[item.style] ? item.style : STYLE_NAMES[i % STYLE_NAMES.length];
         return { name, directive: IMAGE_STYLES[name] };
       }
+      function styleNote(items) {
+        return Array.from(new Set(items.map((it, i) => styleOf(it, i).name))).join(", ");
+      }
+
+      /* 이미지에 찍을 라벨 — 설정에 따라 한글을 함께 넣습니다. */
+      function labelLine(ko, en, i) {
+        return state.labelLang === "ko" && ko
+          ? `"${pad2(i + 1)}" in bold followed by "${q(ko)}  ${q(en)}" on the SAME line`
+          : `"${pad2(i + 1)}" in bold followed by "${q(en)}"`;
+      }
 
       const IMG = {
-        property(p, object) {
-          const name = object ? (object.nameEn || object.nameKo) : "the object";
-          return `${IMG_BASE}
-Create ONE square editorial image that makes a single physical property of "${q(name)}" instantly readable.
-Property: ${q(p.titleEn)} (${q(p.axis)}).
-Context: ${q(p.description)}
-Image direction: ${p.visual}
-Show the phenomenon or response itself — optical behaviour, texture, friction, stiffness, compression, weight, bending, motion, recovery, vibration, sound, thermal response or wear, as specified. The object may appear when needed to show force, contact or structural response; otherwise use a precise material study. One property, one clear image.`;
+        /* ---- 칸 하나를 설명하는 문장 (전체 보드와 부분 편집이 같은 문장을 씁니다) ---- */
+        propertyCell(p, i) {
+          return `Card ${i + 1}:
+  Header text on white: ${state.labelLang === "ko" && p.titleKo
+            ? `"${pad2(i + 1)}" in bold followed by "${q(p.titleKo)}" and a smaller second line "${q(p.titleEn)}"`
+            : `"${pad2(i + 1)}" in bold followed by "${q(p.titleEn)}"`}.
+  Optional small axis badge: "${q(p.axis)}".
+  Image direction: ${p.visual || p.description}`;
         },
-        perception(p, i) {
+        perceptionCell(p, i) {
           const st = styleOf(p, i);
-          return `${IMG_BASE}
-Create ONE square standalone perceptual reference image, rendered as ${st.directive}.
-Everyday situation: ${q(p.situation)}
-What is perceived: ${q(p.titleEn)}.
-Single-scene direction: ${p.visual}
-Demonstrate the perceptual experience itself — visual, tactile, spatial, weight/force, movement, response, sound, temporal or use-related — rather than a generic beauty shot.
-Do NOT depict the analysed object itself as the hero subject. Translate the perception into the most fitting inspirational subject: architecture, fashion, illustration, nature, lighting, furniture, spatial detail or another design-relevant scene.`;
+          return `Cell ${i + 1} — perception context "${q(p.moment)}": one complete standalone perceptual reference image, rendered as ${st.directive}.
+  Everyday situation: ${q(p.situation)}
+  What is perceived: ${p.titleEn} / ${p.titleKo}.
+  Single-scene direction: ${p.visual}
+  Demonstrate the perceptual experience itself — visual, tactile, spatial, weight/force, movement, response, sound, temporal or use-related — rather than making a generic beauty shot. Do not depict the analysed object itself.
+  White caption strip directly under this image: ${labelLine(p.labelKo || p.titleKo, p.label || p.titleEn, i)}.`;
         },
-        emotion(l, i) {
+        emotionPanel(l, i) {
           const st = styleOf(l, i);
+          return `Panel ${i + 1} — emotional keyword image, rendered as ${st.directive}.
+  Emotion: ${l.nameKo} / ${l.nameEn}.
+  Relative intensity: ${Number.isFinite(Number(l.intensity)) ? Math.round(Number(l.intensity)) : 60}/100.
+  Single-scene direction: ${l.visual}
+  Translate the emotional quality into one coherent design-magazine scene; do not simply repeat the analysed object.
+  Caption strip along the bottom edge: ${labelLine(l.labelKo || l.nameKo, l.label || l.nameEn, i)}.`;
+        },
+
+        property(items) {
           return `${IMG_BASE}
-Create ONE landscape editorial mood image, rendered as ${st.directive}.
-Emotion: ${q(l.nameEn)}.
-Relative intensity: ${Number.isFinite(Number(l.intensity)) ? Math.round(Number(l.intensity)) : 60}/100.
-Single-scene direction: ${l.visual}
-Translate the emotional quality into one coherent, sophisticated design-magazine scene; do not simply repeat the analysed object, and avoid infographic symbols.`;
+Create ONE single vertical 2:3 integrated image file that presents exactly ${items.length} material-and-physical-property cards on a clean premium editorial board.
+Layout: a compact multi-row two-column grid of bordered white cards with thin light-grey lines and generous outer margins. Fit all cards cleanly on one board.
+Each card contains ONE image that clearly communicates the property or response: optical behaviour, texture, friction, stiffness, compression, weight/inertia, bending, motion, recovery, vibration, sound, thermal response, wear, or another specified phenomenon.
+The original object may appear when needed to show motion, force, contact or structural response; do not reduce every property to a generic surface sample.
+One property, one image, one card. Render only the specified card texts and no extra paragraphs.
+${items.map((p, i) => IMG.propertyCell(p, i)).join("\n")}`;
+        },
+        perception(items) {
+          return `${IMG_BASE}
+Create ONE single vertical 2:3 integrated image file containing exactly ${items.length} perceptual-reference images on a clean white editorial board.
+Layout: a balanced adaptive two-column grid, read left-to-right and top-to-bottom. Each cell has one image plus a white caption strip beneath. Thin light-grey hairlines, consistent gutters, generous margins.
+The images collectively explain the important perceptions inferred from the analysed object, but they must NOT directly re-depict that object. Instead, each image should choose the most fitting inspirational subject — architecture, fashion, illustration, nature, lighting, furniture, spatial detail, or another design-relevant scene — to express the perception most clearly.
+${items.map((p, i) => IMG.perceptionCell(p, i)).join("\n")}
+
+[DIVERSITY RULES]
+- Include both immediate perceptions and experience-based perceptions when specified.
+- Never use the analysed object itself as the hero subject. Translate the perception into the most effective inspirational subject.
+- Vary scale, camera angle, body/hand interaction, lighting, motion state and spatial context according to each perception.
+- No identifiable faces; hands or partial bodies only when they help explain contact, force, posture, movement or use.
+- Avoid repeating the same composition.
+- Styles used: ${styleNote(items)}.
+${IMG_LABEL_RULE}`;
+        },
+        emotion(emotion) {
+          const layers = emotion.layers || [];
+          return `${IMG_BASE}
+Generate ONE single vertical 2:3 editorial mood board containing exactly ${layers.length === 1 ? "ONE" : "TWO"} refined emotion image${layers.length === 1 ? "" : "s"} derived from the analysed object.
+These are the most representative experience-based emotional keywords a user is left with after encountering the object.
+Layout: equal full-width panels stacked vertically, with narrow white outer margins, thin light-grey dividers and clean caption strips.
+Each panel should feel like a premium design-magazine image similar in sophistication to the perception imagery. Use elegant scenes, not infographic symbols.
+${layers.map((l, i) => IMG.emotionPanel(l, i)).join("\n")}
+${IMG_LABEL_RULE}`;
+        },
+
+        /* 단계 이름으로 전체 보드 프롬프트를 고릅니다. */
+        board(key) {
+          if (key === "property") return IMG.property(state.properties);
+          if (key === "perception") return IMG.perception(state.perceptions);
+          if (key === "emotion") return state.emotion ? IMG.emotion(state.emotion) : "";
+          return "";
+        },
+
+        /* 기존 통합 이미지에서 한 칸만 바꾸는 편집 프롬프트 */
+        edit(key, idx) {
+          const map = {
+            property:   { unit: "card",  list: state.properties, cell: IMG.propertyCell },
+            perception: { unit: "cell",  list: state.perceptions, cell: IMG.perceptionCell },
+            emotion:    { unit: "panel", list: state.emotion ? state.emotion.layers : [], cell: IMG.emotionPanel }
+          };
+          const spec = map[key];
+          const item = spec.list.find(x => x.index === idx);
+          const n = pad2(idx);
+          return `Edit the supplied image. It is a finished vertical 2:3 editorial board containing exactly ${spec.list.length} numbered ${spec.unit}s, each with one picture and a white caption strip whose text starts with its number.
+Change ONLY ${spec.unit} ${n} — the ${spec.unit} whose caption starts with "${n}". Replace that ${spec.unit}'s picture and caption with the new content below, inside exactly the same frame position and size.
+Keep everything else exactly as it is: every other ${spec.unit}'s picture, crop, colours, lighting and caption text; the grid, gutters, hairlines, margins, background, overall layout and typography. Do not redraw, restyle, reorder, renumber or re-letter anything outside ${spec.unit} ${n}.
+New content for ${spec.unit} ${n}:
+${spec.cell(item, idx - 1)}
+Set the new caption in the same font, weight, size and white strip as the other captions, large and clearly legible. Add no other new text anywhere. No watermark, no logo, no identifiable faces.`;
         }
       };
-
-      const ITEM_IMAGE_SIZE = { property: "1024x1024", perception: "1024x1024", emotion: "1536x1024" };
-      const BOARD_STAGES = {
-        property:   { title: "물성 분석", en: "Physical Properties", cols: 2, ratio: 1 },
-        perception: { title: "지각 분석", en: "Perception in Experience", cols: 2, ratio: 1 },
-        emotion:    { title: "대표 감성", en: "Experience-based Emotions", cols: 1, ratio: 1024 / 1536 }
-      };
-      const STAGE_LABEL = { property: "물성", perception: "지각", emotion: "대표 감성" };
-
-      function stageItems(stage) {
-        if (stage === "property") return state.properties;
-        if (stage === "perception") return state.perceptions;
-        if (stage === "emotion") return state.emotion && Array.isArray(state.emotion.layers) ? state.emotion.layers : [];
-        return [];
-      }
-      function itemPrompt(stage, item, i) {
-        if (stage === "property") return IMG.property(item, state.object);
-        if (stage === "perception") return IMG.perception(item, i);
-        return IMG.emotion(item, i);
-      }
-      function itemCaption(stage, it) {
-        if (stage === "property") return { ko: it.titleKo, en: it.titleEn, tag: it.axis };
-        if (stage === "perception") return { ko: it.titleKo, en: it.titleEn, tag: it.moment };
-        return { ko: it.nameKo, en: it.nameEn, tag: it.phase };
-      }
-      function itemImg(stage, id) {
-        const m = state.itemImages && state.itemImages[stage];
-        return m && m[id] ? m[id] : null;
-      }
-      /* 이전 버전(한 장 통합 생성)에서 만든 보드인지 — 이 경우 칸별 교체가 불가능합니다. */
-      function isLegacyBoard(stage) {
-        return !!(state.images && state.images[stage]) && !(state.boardKind && state.boardKind[stage] === "items");
-      }
-
-      /* ---- 캔버스 보드 ---- */
-      function loadImg(src) {
-        return new Promise(res => {
-          if (!src) { res(null); return; }
-          const im = new Image();
-          im.onload = () => res(im);
-          im.onerror = () => res(null);
-          im.src = src;
-        });
-      }
-      /* 생성된 PNG를 JPEG data URL로 줄여 저장 용량을 낮춥니다. */
-      async function toJpeg(src, quality) {
-        const im = await loadImg(src);
-        if (!im || !im.naturalWidth) return src;
-        try {
-          const cv = document.createElement("canvas");
-          cv.width = im.naturalWidth; cv.height = im.naturalHeight;
-          const ctx = cv.getContext("2d");
-          ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, cv.width, cv.height);
-          ctx.drawImage(im, 0, 0);
-          return cv.toDataURL("image/jpeg", quality || 0.88);
-        } catch (e) { return src; }
-      }
-      async function ensureFonts() {
-        try {
-          if (document.fonts && document.fonts.load) {
-            await Promise.all([
-              document.fonts.load("800 30px Pretendard"),
-              document.fonts.load("700 22px Pretendard"),
-              document.fonts.load("400 22px Pretendard")
-            ]);
-          }
-        } catch (e) { /* 시스템 글꼴로 대체 */ }
-      }
-      function wrapLines(ctx, text, maxW) {
-        const out = [];
-        let line = "";
-        const tokens = String(text || "").split(/(\s+)/).filter(t => t.length);
-        for (const tk of tokens) {
-          if (ctx.measureText(line + tk).width <= maxW) { line += tk; continue; }
-          if (line.trim()) { out.push(line.trim()); line = ""; }
-          if (/^\s+$/.test(tk)) continue;
-          if (ctx.measureText(tk).width <= maxW) { line = tk; continue; }
-          for (const ch of tk) {
-            if (line && ctx.measureText(line + ch).width > maxW) { out.push(line); line = ch; }
-            else line += ch;
-          }
-        }
-        if (line.trim()) out.push(line.trim());
-        return out.length ? out : [""];
-      }
-      function drawCover(ctx, im, x, y, w, h) {
-        const s = Math.max(w / im.naturalWidth, h / im.naturalHeight);
-        const sw = w / s, sh = h / s;
-        ctx.drawImage(im, (im.naturalWidth - sw) / 2, (im.naturalHeight - sh) / 2, sw, sh, x, y, w, h);
-      }
-
-      async function composeBoard(stage) {
-        const cfg = BOARD_STAGES[stage];
-        const items = stageItems(stage);
-        if (!cfg || !items.length) return null;
-        await ensureFonts();
-
-        const FONT = "Pretendard, -apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif";
-        const W = 1200, M = 56, G = 28, cols = cfg.cols;
-        const cellW = Math.floor((W - M * 2 - G * (cols - 1)) / cols);
-        const imgH = Math.round(cellW * cfg.ratio);
-        const korean = state.labelLang === "ko";
-        const PAD = 20;
-        const SZ = cols === 1
-          ? { tag: 22, title: 34, en: 24 }
-          : { tag: 20, title: 28, en: 21 };
-        const textW = cellW - PAD * 2;
-
-        const meas = document.createElement("canvas").getContext("2d");
-        const caps = items.map((it, i) => {
-          const c = itemCaption(stage, it);
-          meas.font = `800 ${SZ.title}px ${FONT}`;
-          const titleLines = wrapLines(meas, `${pad2(i + 1)}  ${korean ? (c.ko || c.en) : (c.en || c.ko)}`, textW);
-          meas.font = `400 ${SZ.en}px ${FONT}`;
-          const enLines = korean && c.en ? wrapLines(meas, c.en, textW) : [];
-          const h = PAD + (c.tag ? Math.round(SZ.tag * 1.5) + 6 : 0)
-            + titleLines.length * Math.round(SZ.title * 1.32)
-            + enLines.length * Math.round(SZ.en * 1.45) + PAD;
-          return { c, titleLines, enLines, h };
-        });
-
-        const HEAD = 150;
-        const rowH = [];
-        for (let r = 0; r * cols < items.length; r++) {
-          rowH.push(imgH + Math.max.apply(null, caps.slice(r * cols, r * cols + cols).map(c => c.h)));
-        }
-        const H = M + HEAD + rowH.reduce((a, b) => a + b, 0) + G * (rowH.length - 1) + M;
-
-        const cv = document.createElement("canvas");
-        cv.width = W; cv.height = H;
-        const ctx = cv.getContext("2d");
-        ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, W, H);
-        ctx.textBaseline = "top";
-
-        ctx.fillStyle = "#64748b"; ctx.font = `700 20px ${FONT}`;
-        ctx.fillText("OBJECT EXPERIENCE LAB", M, M);
-        ctx.fillStyle = "#0f172a"; ctx.font = `800 40px ${FONT}`;
-        ctx.fillText(cfg.title, M, M + 32);
-        ctx.fillStyle = "#64748b"; ctx.font = `400 22px ${FONT}`;
-        ctx.fillText(`${objectName() || ""}${objectName() ? "  ·  " : ""}${cfg.en}`, M, M + 86);
-        ctx.fillStyle = "#0f172a"; ctx.fillRect(M, M + HEAD - 24, W - M * 2, 3);
-
-        const imgs = await Promise.all(items.map(it => loadImg(itemImg(stage, it.id))));
-        let y = M + HEAD;
-        for (let r = 0; r < rowH.length; r++) {
-          for (let k = 0; k < cols; k++) {
-            const i = r * cols + k;
-            if (i >= items.length) break;
-            const x = M + k * (cellW + G);
-            const cap = caps[i];
-            ctx.fillStyle = "#ffffff"; ctx.fillRect(x, y, cellW, rowH[r]);
-            if (imgs[i]) {
-              drawCover(ctx, imgs[i], x, y, cellW, imgH);
-            } else {
-              ctx.fillStyle = "#f1f5f9"; ctx.fillRect(x, y, cellW, imgH);
-              ctx.fillStyle = "#94a3b8"; ctx.font = `700 24px ${FONT}`;
-              const t = "이미지 없음";
-              ctx.fillText(t, x + (cellW - ctx.measureText(t).width) / 2, y + imgH / 2 - 12);
-            }
-            let ty = y + imgH + PAD;
-            if (cap.c.tag) {
-              ctx.fillStyle = "#0f766e"; ctx.font = `700 ${SZ.tag}px ${FONT}`;
-              ctx.fillText(cap.c.tag, x + PAD, ty);
-              ty += Math.round(SZ.tag * 1.5) + 6;
-            }
-            ctx.fillStyle = "#0f172a"; ctx.font = `800 ${SZ.title}px ${FONT}`;
-            cap.titleLines.forEach(l => { ctx.fillText(l, x + PAD, ty); ty += Math.round(SZ.title * 1.32); });
-            ctx.fillStyle = "#64748b"; ctx.font = `400 ${SZ.en}px ${FONT}`;
-            cap.enLines.forEach(l => { ctx.fillText(l, x + PAD, ty); ty += Math.round(SZ.en * 1.45); });
-            ctx.strokeStyle = "#e2e8f0"; ctx.lineWidth = 2;
-            ctx.strokeRect(x + 1, y + 1, cellW - 2, rowH[r] - 2);
-          }
-          y += rowH[r] + G;
-        }
-        return cv.toDataURL("image/jpeg", 0.9);
-      }
 
       /* =========================================================
          4. 유틸 — 이스케이프 / 토스트 / ID
@@ -640,196 +545,218 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           (kind === "error" ? "bg-red-700" : "bg-slate-900");
         el.textContent = msg;
         clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => { if (el && el.parentNode) el.parentNode.removeChild(el); }, 3200);
+        toastTimer = setTimeout(() => { if (el && el.parentNode) el.parentNode.removeChild(el); }, 3600);
+      }
+
+      function isQuotaError(e) {
+        if (!e) return false;
+        const n = String(e.name || "");
+        const m = String(e.message || "");
+        return /quota/i.test(n) || /quota/i.test(m) || e.code === 22 || e.code === 1014 || n === "NS_ERROR_DOM_QUOTA_REACHED";
       }
 
       /* =========================================================
-         5. 저장소 — 프로젝트 텍스트는 localStorage, 이미지는 IndexedDB
-         저장 공간이 부족하면 가장 오래된 프로젝트부터 지워 공간을 확보합니다.
+         5. 저장소 — 프로젝트와 이미지 모두 IndexedDB
+         localStorage는 브라우저 전체가 약 5MB를 함께 쓰기 때문에 같은 주소의 다른 도구와
+         용량을 나눠 쓰다 쉽게 가득 찹니다. IndexedDB는 훨씬 큰 공간을 쓸 수 있습니다.
+         그래도 공간이 부족하면 지금 작업 중인 프로젝트를 뺀 가장 오래된 프로젝트부터
+         지워 공간을 확보한 뒤 다시 저장합니다.
          ========================================================= */
-      const BOARD_SLOTS = ["source", "property", "perception", "emotion"];
-      const blankImages = () => ({ source: null, property: null, perception: null, emotion: null });
-      const blankItemImages = () => ({ property: {}, perception: {}, emotion: {} });
+      const IMAGE_SLOTS = ["source", "cmf", "property", "perception", "emotion"];
+      const blankImages = () => ({ source: null, cmf: null, property: null, perception: null, emotion: null });
 
-      /* ---------------------------------------------------------
-         저장 방식 — '감성 · 지각 · 인터랙션 컨셉 랩 v12.10'과 같은 방식입니다.
-         · 프로젝트 글(분석 내용)은 localStorage에 목록으로 저장합니다. (최대 5개)
-         · 이미지는 IndexedDB 'images' 저장소에 data URL 문자열로 저장합니다.
-           키는 `프로젝트id::슬롯` 입니다. (보드: property / perception / emotion / source,
-           항목별 이미지: item::단계::항목id)
-         --------------------------------------------------------- */
-      let imageDbPromise = null;
-      const ImageDB = {
+      let dbPromise = null;
+      const DB = {
         open() {
           if (!("indexedDB" in window) || !window.indexedDB) return Promise.reject(new Error("IDB_UNAVAILABLE"));
-          if (imageDbPromise) return imageDbPromise;
-          imageDbPromise = new Promise((res, rej) => {
-            /* v5~v7이 이 DB를 버전 2로 올려 두었기 때문에 같은 버전으로 엽니다. */
-            const req = indexedDB.open(CONFIG.IMAGE_DB.name, 2);
+          if (dbPromise) return dbPromise;
+          dbPromise = new Promise((res, rej) => {
+            let req;
+            try { req = indexedDB.open(CONFIG.DB.name, CONFIG.DB.version); } catch (e) { rej(e); return; }
             req.onupgradeneeded = () => {
               const db = req.result;
-              if (!db.objectStoreNames.contains(CONFIG.IMAGE_DB.store)) {
-                db.createObjectStore(CONFIG.IMAGE_DB.store, { keyPath: "id" });
-              }
+              [CONFIG.DB.images, CONFIG.DB.projects].forEach(s => {
+                if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: "id" });
+              });
             };
             req.onsuccess = () => {
               const db = req.result;
-              db.onversionchange = () => { try { db.close(); } catch (e) { /* 무시 */ } imageDbPromise = null; };
+              db.onversionchange = () => { try { db.close(); } catch (e) { /* 무시 */ } dbPromise = null; };
               res(db);
             };
             req.onerror = () => rej(req.error || new Error("IDB_OPEN_FAILED"));
+            req.onblocked = () => rej(new Error("IDB_BLOCKED"));
           });
-          imageDbPromise.catch(() => { imageDbPromise = null; });
-          return imageDbPromise;
+          dbPromise.catch(() => { dbPromise = null; });
+          return dbPromise;
         },
-        _act(mode, fn, storeName) {
-          const name = storeName || CONFIG.IMAGE_DB.store;
-          return ImageDB.open().then(db => new Promise((res, rej) => {
-            const tx = db.transaction(name, mode);
-            const rq = fn(tx.objectStore(name));
-            rq.onsuccess = () => res(rq.result);
-            rq.onerror = () => rej(rq.error || new Error("IDB_REQUEST_FAILED"));
+        /* 용량 초과는 요청이 아니라 트랜잭션 중단(abort)으로 알려지므로 트랜잭션 완료를 기준으로 판단합니다. */
+        run(storeName, mode, fn) {
+          return DB.open().then(db => new Promise((res, rej) => {
+            let tx;
+            try { tx = db.transaction(storeName, mode); } catch (e) { rej(e); return; }
+            let result;
+            let rq;
+            try { rq = fn(tx.objectStore(storeName)); }
+            catch (e) { rej(e); try { tx.abort(); } catch (x) { /* 무시 */ } return; }
+            rq.onsuccess = () => { result = rq.result; };
+            tx.oncomplete = () => res(result);
+            tx.onerror = () => rej(tx.error || rq.error || new Error("IDB_REQUEST_FAILED"));
+            tx.onabort = () => rej(tx.error || new Error("IDB_ABORTED"));
           }));
         },
+        put: (s, v) => DB.run(s, "readwrite", st => st.put(v)),
+        get: (s, k) => DB.run(s, "readonly", st => st.get(k)),
+        getAll: s => DB.run(s, "readonly", st => st.getAll()),
+        del: (s, k) => DB.run(s, "readwrite", st => st.delete(k))
+      };
+
+      const ImageDB = {
         key: (projectId, slot) => `${projectId}::${slot}`,
-        range: prefix => IDBKeyRange.bound(prefix, prefix + " "),
         async put(projectId, slot, dataUrl) {
-          try {
-            await ImageDB._act("readwrite", st => st.put({
-              id: ImageDB.key(projectId, slot), projectId, slot, dataUrl, savedAt: Date.now()
-            }));
-            return true;
-          } catch (e) { console.warn("이미지 저장 실패", slot, e); return false; }
+          for (let i = 0; i <= CONFIG.MAX_PROJECTS; i++) {
+            try {
+              await DB.put(CONFIG.DB.images, { id: ImageDB.key(projectId, slot), projectId, slot, dataUrl, savedAt: Date.now() });
+              return true;
+            } catch (e) {
+              if (!isQuotaError(e)) { console.warn("이미지 저장 실패", e); return false; }
+              const victim = Store.oldestExcept(projectId);
+              if (!victim) return false;
+              await Store.remove(victim.id);
+              toast(`저장 공간을 확보하려고 오래된 프로젝트 '${victim.title}'를 정리했습니다.`);
+            }
+          }
+          return false;
         },
         async get(projectId, slot) {
           try {
-            const row = await ImageDB._act("readonly", st => st.get(ImageDB.key(projectId, slot)));
-            return row ? await rowDataUrl(row) : null;
+            const row = await DB.get(CONFIG.DB.images, ImageDB.key(projectId, slot));
+            return row && row.dataUrl ? row.dataUrl : null;
           } catch (e) { return null; }
         },
-        /* 프로젝트의 보드 이미지와 항목별 이미지를 모두 읽어 옵니다. */
         async loadAll(projectId) {
-          const images = blankImages();
-          const itemImages = blankItemImages();
-          let failed = false;
-          try {
-            const prefix = `${projectId}::`;
-            const rows = await ImageDB._act("readonly", st => st.getAll(ImageDB.range(prefix)));
-            for (const row of (rows || [])) {
-              const url = await rowDataUrl(row);
-              if (!url) continue;
-              const slot = String(row.id).slice(prefix.length);
-              if (slot.indexOf("item::") === 0) {
-                const parts = slot.split("::");
-                if (itemImages[parts[1]]) itemImages[parts[1]][parts.slice(2).join("::")] = url;
-              } else if (BOARD_SLOTS.includes(slot)) {
-                images[slot] = url;
-              }
-            }
-          } catch (e) {
-            console.warn("이미지를 불러오지 못했습니다.", e);
-            failed = true;
-          }
-          return { images, itemImages, failed };
+          const out = blankImages();
+          for (const slot of IMAGE_SLOTS) out[slot] = await ImageDB.get(projectId, slot);
+          return out;
         },
-        async remove(projectId, slot) {
-          try { await ImageDB._act("readwrite", st => st.delete(ImageDB.key(projectId, slot))); return true; }
-          catch (e) { console.warn("이미지 삭제 실패", slot, e); return false; }
-        },
-        async removePrefix(prefix) {
-          try { await ImageDB._act("readwrite", st => st.delete(ImageDB.range(prefix))); return true; }
-          catch (e) { return false; }
+        remove(projectId, slot) {
+          return DB.del(CONFIG.DB.images, ImageDB.key(projectId, slot)).catch(() => {});
         },
         removeProject(projectId) {
-          return ImageDB.removePrefix(`${projectId}::`);
+          return Promise.all(IMAGE_SLOTS.map(slot => ImageDB.remove(projectId, slot)));
         }
       };
 
-      /* v5~v7은 이미지를 Blob/바이트 배열로 저장했습니다. 읽을 때 data URL로 바꾸고 그 형식으로 다시 저장합니다. */
-      function readAsDataUrl(blob) {
-        return new Promise((res, rej) => {
-          const fr = new FileReader();
-          fr.onload = () => res(fr.result);
-          fr.onerror = () => rej(fr.error || new Error("READ_FAILED"));
-          fr.readAsDataURL(blob);
-        });
-      }
-      async function rowDataUrl(row) {
-        if (!row) return null;
-        if (typeof row.dataUrl === "string" && row.dataUrl.indexOf("data:") === 0) return row.dataUrl;
-        let blob = null;
-        if (row.buf && row.buf.byteLength) blob = new Blob([row.buf], { type: row.type || "image/jpeg" });
-        else if (row.blob && row.blob.size) blob = row.blob;
-        if (!blob) return null;
-        try {
-          const dataUrl = await readAsDataUrl(blob);
-          if (typeof dataUrl !== "string" || dataUrl.indexOf("data:") !== 0) return null;
-          ImageDB._act("readwrite", st => st.put({
-            id: row.id, projectId: row.projectId, slot: row.slot, dataUrl, savedAt: row.savedAt || Date.now()
-          })).catch(() => {});
-          return dataUrl;
-        } catch (e) {
-          console.warn("이전 형식 이미지를 읽지 못했습니다.", row.id, e);
-          return null;
-        }
-      }
-
       const Store = {
-        list() {
+        ready: false,
+        mode: "idb",
+        cache: [],
+        lastSig: {},
+        queue: Promise.resolve(),
+
+        async init() {
+          let legacy = [];
           try {
             const raw = localStorage.getItem(CONFIG.PROJECTS_KEY);
-            const list = raw ? JSON.parse(raw) : [];
-            return Array.isArray(list) ? list : [];
-          } catch (e) {
-            console.warn("저장 목록을 읽지 못했습니다.", e);
-            return [];
-          }
-        },
-        _write(list) {
-          try { localStorage.setItem(CONFIG.PROJECTS_KEY, JSON.stringify(list)); return true; }
-          catch (e) { return false; }
-        },
-        save(snap, meta) {
-          let list = Store.list().filter(p => p.id !== meta.id);
-          list.unshift({ id: meta.id, title: meta.title, savedAt: Date.now(), data: snap });
-          if (list.length > CONFIG.MAX_PROJECTS) {
-            list.slice(CONFIG.MAX_PROJECTS).forEach(p => ImageDB.removeProject(p.id));
-            list = list.slice(0, CONFIG.MAX_PROJECTS);
-          }
-          if (Store._write(list)) return { ok: true };
-          /* 공간이 부족하면 가장 오래된 프로젝트부터 하나씩 지우며 다시 저장합니다. */
-          let reduced = list.slice();
-          while (reduced.length > 1) {
-            reduced = reduced.slice(0, reduced.length - 1);
-            if (Store._write(reduced)) {
-              list.slice(reduced.length).forEach(p => ImageDB.removeProject(p.id));
-              return { ok: true, pruned: list.length - reduced.length };
-            }
-          }
-          return { ok: false };
-        },
-        remove(id) {
-          ImageDB.removeProject(id);
-          return Store._write(Store.list().filter(p => p.id !== id));
-        },
-        /* v5~v7이 IndexedDB 'projects' 저장소에 둔 프로젝트를 localStorage 목록으로 되돌립니다. */
-        async migrateFromIdb() {
+            const l = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(l)) legacy = l.filter(p => p && p.id);
+          } catch (e) { /* 저장소 차단 환경 */ }
+
           try {
-            const db = await ImageDB.open();
-            if (!db.objectStoreNames.contains("projects")) return false;
-            const rows = await ImageDB._act("readonly", st => st.getAll(), "projects");
-            if (!rows || !rows.length) return false;
-            const have = new Set(Store.list().map(p => p.id));
-            const add = rows.filter(r => r && r.id && r.data && !have.has(r.id))
-              .map(r => ({ id: r.id, title: r.title || "이름 없는 프로젝트", savedAt: r.savedAt || Date.now(), data: r.data }));
-            if (!add.length) { await ImageDB._act("readwrite", st => st.clear(), "projects"); return false; }
-            const list = Store.list().concat(add).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)).slice(0, CONFIG.MAX_PROJECTS);
-            if (Store._write(list)) {
-              await ImageDB._act("readwrite", st => st.clear(), "projects");
-              return true;
+            const rows = await Promise.race([
+              DB.getAll(CONFIG.DB.projects),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("IDB_TIMEOUT")), 5000))
+            ]);
+            const list = Array.isArray(rows) ? rows.filter(p => p && p.id) : [];
+            for (const p of legacy) {
+              if (list.some(x => x.id === p.id)) continue;
+              try { await DB.put(CONFIG.DB.projects, p); list.push(p); }
+              catch (e) { console.warn("예전 프로젝트를 옮기지 못했습니다.", e); }
             }
-          } catch (e) { console.warn("이전 프로젝트를 옮기지 못했습니다.", e); }
-          return false;
+            /* 옮긴 뒤에는 localStorage를 비워 다른 도구와 함께 쓰는 공간을 돌려줍니다. */
+            if (legacy.length) { try { localStorage.removeItem(CONFIG.PROJECTS_KEY); } catch (e) { /* 무시 */ } }
+            Store.mode = "idb";
+            Store.cache = list;
+          } catch (e) {
+            console.warn("IndexedDB를 쓸 수 없어 브라우저 기본 저장소를 사용합니다.", e);
+            Store.mode = "ls";
+            Store.cache = legacy;
+          }
+
+          Store.cache.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+          const extra = Store.cache.slice(CONFIG.MAX_PROJECTS);
+          Store.cache = Store.cache.slice(0, CONFIG.MAX_PROJECTS);
+          for (const p of extra) await Store._purge(p.id);
+          if (Store.mode === "ls" && extra.length) {
+            try { localStorage.setItem(CONFIG.PROJECTS_KEY, JSON.stringify(Store.cache)); } catch (e) { /* 무시 */ }
+          }
+          Store.ready = true;
+
+          /* 브라우저가 공간이 부족할 때 임의로 지우지 않도록 영구 저장을 요청합니다. */
+          try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* 무시 */ }
+        },
+
+        list() { return Store.cache.slice(); },
+
+        /* 목록은 최신순이므로 맨 뒤가 가장 오래된 프로젝트입니다. */
+        oldestExcept(id) {
+          const others = Store.cache.filter(p => p.id !== id);
+          return others.length ? others[others.length - 1] : null;
+        },
+
+        async _purge(id) {
+          if (Store.mode === "idb") { try { await DB.del(CONFIG.DB.projects, id); } catch (e) { /* 무시 */ } }
+          await ImageDB.removeProject(id);
+          delete Store.lastSig[id];
+        },
+
+        async _writeRow(row) {
+          if (Store.mode === "idb") await DB.put(CONFIG.DB.projects, row);
+          else localStorage.setItem(CONFIG.PROJECTS_KEY, JSON.stringify(Store.cache));
+        },
+
+        /* 저장 요청은 순서대로 하나씩 처리해 서로 덮어쓰지 않게 합니다. */
+        save(snap, meta) {
+          const job = Store.queue.then(() => Store._save(snap, meta));
+          Store.queue = job.catch(() => {});
+          return job;
+        },
+
+        async _save(snap, meta) {
+          let sig;
+          try { sig = `${meta.title}\u0000${JSON.stringify(snap)}`; } catch (e) { return { ok: false }; }
+          if (Store.lastSig[meta.id] === sig && Store.cache.some(p => p.id === meta.id)) return { ok: true, unchanged: true, freed: [] };
+
+          const row = { id: meta.id, title: meta.title, savedAt: Date.now(), data: snap };
+          Store.cache = [row].concat(Store.cache.filter(p => p.id !== meta.id));
+          while (Store.cache.length > CONFIG.MAX_PROJECTS) {
+            const old = Store.cache.pop();
+            await Store._purge(old.id);
+          }
+
+          const freed = [];
+          for (;;) {
+            try {
+              await Store._writeRow(row);
+              Store.lastSig[meta.id] = sig;
+              return { ok: true, freed };
+            } catch (e) {
+              if (!isQuotaError(e)) { console.warn("프로젝트 저장 실패", e); return { ok: false }; }
+              const victim = Store.oldestExcept(meta.id);
+              if (!victim) return { ok: false, full: true };
+              Store.cache = Store.cache.filter(p => p.id !== victim.id);
+              await Store._purge(victim.id);
+              freed.push(victim.title);
+            }
+          }
+        },
+
+        async remove(id) {
+          Store.cache = Store.cache.filter(p => p.id !== id);
+          await Store._purge(id);
+          if (Store.mode === "ls") {
+            try { localStorage.setItem(CONFIG.PROJECTS_KEY, JSON.stringify(Store.cache)); } catch (e) { /* 무시 */ }
+          }
         }
       };
 
@@ -847,11 +774,8 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           properties: [],
           perceptions: [],
           emotion: null,
+          synthesis: null,
           images: blankImages(),
-          itemImages: blankItemImages(),
-          boardKind: {},
-          editSel: {},
-          imagesLoading: false,
           createdAt: Date.now()
         };
       }
@@ -873,6 +797,14 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       function setDraft(id, v) { drafts[id] = v; }
       window.setDraft = setDraft;
 
+      /* 수정 지시 입력란·항목 선택은 프로젝트별 상태이므로 프로젝트를 바꿀 때 비웁니다. */
+      function resetEditDrafts() {
+        ["property", "perception", "emotion"].forEach(k => {
+          delete drafts[`ins-${k}`];
+          delete drafts[`sel-${k}`];
+        });
+      }
+
       function setState(patch, resetScroll) {
         Object.assign(state, patch);
         render(resetScroll);
@@ -886,15 +818,20 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       function loadSession() {
         try {
           state.apiKey = sessionStorage.getItem(CONFIG.SESSION_KEY_API) || "";
-          sessionStorage.removeItem(CONFIG.SESSION_KEY_PREFS);
-          /* 이미지 품질은 '표준', 라벨은 '한글 + 영문'으로 고정합니다. */
-          state.quality = "medium";
-          state.labelLang = "ko";
+          const raw = sessionStorage.getItem(CONFIG.SESSION_KEY_PREFS);
+          if (raw) {
+            const m = JSON.parse(raw);
+            if (m && typeof m === "object") {
+              if (QUALITIES.some(x => x.id === m.quality)) state.quality = m.quality;
+              if (LABEL_LANGS.some(x => x.id === m.labelLang)) state.labelLang = m.labelLang;
+            }
+          }
         } catch (e) { /* 세션 저장소 차단 환경 */ }
       }
       function saveSession() {
         try {
           sessionStorage.setItem(CONFIG.SESSION_KEY_API, state.apiKey || "");
+          sessionStorage.setItem(CONFIG.SESSION_KEY_PREFS, JSON.stringify({ quality: state.quality, labelLang: state.labelLang }));
         } catch (e) { /* 무시 */ }
       }
 
@@ -904,11 +841,6 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
          파라미터를 지원하지 않는 모델을 만나면 옵션을 하나씩 덜어내며 재시도합니다.
          ========================================================= */
       let activeController = null;
-      /* 한 작업(withLoading) 안의 모든 요청이 같은 취소 신호를 씁니다. 취소 버튼 하나로 동시 요청이 함께 멈춥니다. */
-      function currentController() {
-        if (!activeController) activeController = new AbortController();
-        return activeController;
-      }
 
       function parseModelJson(text) {
         let t = String(text || "").trim();
@@ -946,15 +878,15 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         return `요청이 거부되었습니다 (상태 ${status}).${detail ? " " + detail : ""}`;
       }
 
-      async function postJson(path, body, controller) {
+      async function postApi(path, body, controller) {
+        const isForm = typeof FormData !== "undefined" && body instanceof FormData;
+        const headers = { "Authorization": `Bearer ${state.apiKey || ""}` };
+        if (!isForm) headers["Content-Type"] = "application/json";
         const res = await fetch(CONFIG.API_BASE + path, {
           method: "POST",
           signal: controller.signal,
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${state.apiKey || ""}`
-          },
-          body: JSON.stringify(body)
+          headers,
+          body: isForm ? body : JSON.stringify(body)
         });
         let payload = null;
         try { payload = await res.json(); } catch (e) { payload = null; }
@@ -969,7 +901,8 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       }
 
       async function callText(systemPrompt, userPrompt, photoDataUrl) {
-        const controller = currentController();
+        const controller = new AbortController();
+        activeController = controller;
 
         const userContent = photoDataUrl
           ? [{ type: "input_text", text: userPrompt }, { type: "input_image", image_url: photoDataUrl, detail: "high" }]
@@ -979,8 +912,8 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           { role: "user", content: userContent }
         ];
         const variants = [
-          { model: CONFIG.TEXT_MODEL, input, text: { format: { type: "json_object" } }, max_output_tokens: 12000, reasoning: { effort: "low" } },
-          { model: CONFIG.TEXT_MODEL, input, text: { format: { type: "json_object" } }, max_output_tokens: 12000 },
+          { model: CONFIG.TEXT_MODEL, input, text: { format: { type: "json_object" } }, max_output_tokens: 16000, reasoning: { effort: "low" } },
+          { model: CONFIG.TEXT_MODEL, input, text: { format: { type: "json_object" } }, max_output_tokens: 16000 },
           { model: CONFIG.TEXT_MODEL, input, text: { format: { type: "json_object" } } },
           { model: CONFIG.TEXT_MODEL, input }
         ];
@@ -993,9 +926,11 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
         while (vi < variants.length) {
           try {
-            const data = await postJson("/responses", variants[vi], controller);
+            const data = await postApi("/responses", variants[vi], controller);
             if (data && data.status === "incomplete") {
-              throw new Error("응답이 최대 길이에 도달해 잘렸습니다. 선택 항목을 줄이고 다시 시도해 주세요.");
+              const e = new Error("응답이 최대 길이에 도달해 잘렸습니다. 수정 지시를 더 간단히 적어 다시 시도해 주세요.");
+              e.noRetry = true;
+              throw e;
             }
             const text = extractOutputText(data);
             if (!text.trim()) throw new Error("AI가 빈 응답을 반환했습니다. 다시 시도해 주세요.");
@@ -1004,7 +939,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             if (err.name === "AbortError") { const e = new Error("__aborted__"); e.aborted = true; throw e; }
             lastError = err.message;
             lastStatus = err.status || 0;
-            if (err.fatal) break;
+            if (err.fatal || err.noRetry) break;
             if (err.paramIssue) { vi += 1; attempt = 0; continue; }
             if (attempt >= delays.length) break;
             await new Promise(r => setTimeout(r, delays[attempt]));
@@ -1014,51 +949,84 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         if (photoDataUrl && lastStatus === 400 && /image/i.test(lastError)) {
           throw new Error(`${CONFIG.TEXT_MODEL_LABEL}가 이 사진 입력을 받지 않았습니다. 사진을 빼고 사물 키워드로 분석해 주세요.`);
         }
-        const fail = new Error(lastError);
-        fail.fatal = lastStatus === 401 || lastStatus === 403;
-        throw fail;
+        throw new Error(lastError);
       }
 
-      async function callImage(prompt, size) {
-        const controller = currentController();
-        const sz = size || CONFIG.IMAGE_SIZE;
+      function imageFromResponse(data) {
+        const first = data && Array.isArray(data.data) ? data.data[0] : null;
+        if (first && first.b64_json) return `data:image/png;base64,${first.b64_json}`;
+        if (first && first.url) return first.url;
+        throw new Error("이미지 응답이 비어 있습니다. 다시 시도해 주세요.");
+      }
 
-        const variants = [
-          { model: CONFIG.IMAGE_MODEL, prompt, size: sz, quality: state.quality },
-          { model: CONFIG.IMAGE_MODEL, prompt, size: sz },
-          { model: CONFIG.IMAGE_MODEL, prompt }
-        ];
-        /* 동시에 여러 장을 만들 때 429(요청 과다)가 날 수 있어 대기를 넉넉히 둡니다. */
-        const delays = [2000, 5000, 10000];
-        let lastError = "이미지를 생성하지 못했습니다.";
-        let lastFatal = false;
+      async function runImageVariants(build, delays, fallbackMsg) {
+        let lastError = fallbackMsg;
         let vi = 0;
         let attempt = 0;
-
-        while (vi < variants.length) {
+        const total = build.count;
+        while (vi < total) {
           try {
-            const data = await postJson("/images/generations", variants[vi], controller);
-            const first = data && Array.isArray(data.data) ? data.data[0] : null;
-            if (first && first.b64_json) return `data:image/png;base64,${first.b64_json}`;
-            if (first && first.url) return first.url;
-            throw new Error("이미지 응답이 비어 있습니다. 다시 시도해 주세요.");
+            return imageFromResponse(await build.send(vi));
           } catch (err) {
             if (err.name === "AbortError") { const e = new Error("__aborted__"); e.aborted = true; throw e; }
             lastError = err.message;
-            if (err.fatal) { lastFatal = true; break; }
+            if (err.fatal) { const e = new Error(lastError); e.fatal = true; throw e; }
             if (err.paramIssue) { vi += 1; attempt = 0; continue; }
             if (attempt >= delays.length) break;
             await new Promise(r => setTimeout(r, delays[attempt]));
             attempt += 1;
           }
         }
-        const fail = new Error(lastError);
-        fail.fatal = lastFatal;
-        throw fail;
+        throw new Error(lastError);
+      }
+
+      async function callImage(prompt) {
+        const controller = new AbortController();
+        activeController = controller;
+        const variants = [
+          { model: CONFIG.IMAGE_MODEL, prompt, size: CONFIG.IMAGE_SIZE, quality: state.quality },
+          { model: CONFIG.IMAGE_MODEL, prompt, size: CONFIG.IMAGE_SIZE },
+          { model: CONFIG.IMAGE_MODEL, prompt }
+        ];
+        return runImageVariants({
+          count: variants.length,
+          send: vi => postApi("/images/generations", variants[vi], controller)
+        }, [1200, 3000], "이미지를 생성하지 못했습니다.");
+      }
+
+      /* 기존 통합 이미지를 입력으로 넣어 지정한 칸만 바꿉니다. */
+      async function callImageEdit(prompt, sourceUrl) {
+        const controller = new AbortController();
+        activeController = controller;
+        let blob;
+        try {
+          const r = await fetch(sourceUrl);
+          blob = await r.blob();
+        } catch (e) {
+          throw new Error("편집할 통합 이미지를 읽지 못했습니다.");
+        }
+        const type = blob.type || "image/png";
+        const ext = /jpe?g/i.test(type) ? "jpg" : (/webp/i.test(type) ? "webp" : "png");
+        const variants = [
+          { size: CONFIG.IMAGE_SIZE, quality: state.quality, input_fidelity: "high" },
+          { size: CONFIG.IMAGE_SIZE, quality: state.quality },
+          { size: CONFIG.IMAGE_SIZE },
+          {}
+        ];
+        return runImageVariants({
+          count: variants.length,
+          send: vi => {
+            const form = new FormData();
+            form.append("model", CONFIG.IMAGE_MODEL);
+            form.append("prompt", prompt);
+            form.append("image", new Blob([blob], { type }), `board.${ext}`);
+            Object.keys(variants[vi]).forEach(k => form.append(k, String(variants[vi][k])));
+            return postApi("/images/edits", form, controller);
+          }
+        }, [1200, 3000], "이미지를 편집하지 못했습니다.");
       }
 
       async function withLoading(msg, fn) {
-        activeController = new AbortController();
         setState({ isAnalyzing: true, loadingMsg: msg, errorMsg: null });
         try {
           const out = await fn();
@@ -1067,12 +1035,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         } catch (err) {
           if (err && err.aborted) { setState({ isAnalyzing: false }); toast("작업을 취소했습니다."); return null; }
           console.error(err);
-          if (err && err.fatal) {
-            persist(false);
-            setState({ isAnalyzing: false, step: -1, errorMsg: err.message || "API 키를 다시 확인해 주세요." }, true);
-            return null;
-          }
-          setState({ isAnalyzing: false, errorMsg: err.message || "처리에 실패했습니다." });
+          setState({ isAnalyzing: false, errorMsg: (err && err.message) || "처리에 실패했습니다." });
           return null;
         } finally {
           activeController = null;
@@ -1080,7 +1043,9 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       }
 
       /* =========================================================
-         8-B. 사진 준비 — 긴 변 1280px JPEG로 줄여 전송량과 저장 용량을 낮춥니다.
+         8-B. 사진·이미지 준비
+         - 올린 사진은 긴 변 1280px JPEG로 줄여 전송량과 저장 용량을 낮춥니다.
+         - 생성된 PNG 통합 이미지는 저장 전에 JPEG로 바꿔 용량을 약 1/4로 줄입니다.
          투명 PNG는 흰 바탕에 올려 검게 변하지 않게 합니다.
          ========================================================= */
       function preparePhoto(file) {
@@ -1115,6 +1080,45 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             reject(new Error("이 사진 형식은 열 수 없습니다. JPG나 PNG로 바꿔 다시 올려 주세요."));
           };
           img.src = url;
+        });
+      }
+
+      function blobToDataUrl(blob) {
+        return new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result);
+          fr.onerror = () => rej(fr.error);
+          fr.readAsDataURL(blob);
+        });
+      }
+
+      async function toStorableImage(url) {
+        let src = url;
+        /* 주소로 받은 이미지는 시간이 지나면 만료되므로 가능하면 데이터로 바꿔 둡니다. */
+        if (!/^data:/i.test(src)) {
+          try { src = await blobToDataUrl(await (await fetch(src)).blob()); } catch (e) { return url; }
+        }
+        if (/^data:image\/jpe?g/i.test(src)) return src;
+        return new Promise(resolve => {
+          /* 이미지 디코딩이 멈추는 드문 경우에도 저장이 막히지 않도록 원본으로 넘어갑니다. */
+          const guard = setTimeout(() => resolve(src), 8000);
+          const done = v => { clearTimeout(guard); resolve(v); };
+          const img = new Image();
+          img.onload = () => {
+            const resolve = done;
+            try {
+              const cv = document.createElement("canvas");
+              cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+              const ctx = cv.getContext("2d");
+              if (!ctx || !cv.width) { resolve(src); return; }
+              ctx.fillStyle = "#ffffff";
+              ctx.fillRect(0, 0, cv.width, cv.height);
+              ctx.drawImage(img, 0, 0);
+              resolve(cv.toDataURL("image/jpeg", CONFIG.IMAGE_STORE_QUALITY));
+            } catch (e) { resolve(src); }
+          };
+          img.onerror = () => done(src);
+          img.src = src;
         });
       }
 
@@ -1200,32 +1204,29 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         });
       }
 
-      function normProperty(p, i, traits) {
-        p = p && typeof p === "object" ? p : {};
-        const levels = ["낮음", "중간", "높음"];
-        const value = clampValue(p.value, p.level);
-        return {
-          id: uid("prp"),
-          index: i + 1,
-          axis: str(p.axis) || "물성",
-          titleKo: str(p.titleKo) || `물성 ${i + 1}`,
-          titleEn: str(p.titleEn) || `Property ${i + 1}`,
-          description: str(p.description) || NO_DATA,
-          fromIds: mapFrom(p.from, traits),
-          measure: str(p.measure),
-          value,
-          level: levels.includes(str(p.level)) ? str(p.level) : levelFromValue(value),
-          visual: str(p.visual) || "a professional editorial close-up that expresses this property through surface, light, depth or texture"
-        };
-      }
       function normProperties(raw, traits) {
-        return arr(raw && raw.properties).slice(0, 14).map((p, i) => normProperty(p, i, traits));
+        const levels = ["낮음", "중간", "높음"];
+        return arr(raw && raw.properties).filter(p => p && typeof p === "object").slice(0, 14).map((p, i) => {
+          const value = clampValue(p.value, p.level);
+          return {
+            id: uid("prp"),
+            index: i + 1,
+            axis: str(p.axis) || "물성",
+            titleKo: str(p.titleKo) || `물성 ${i + 1}`,
+            titleEn: str(p.titleEn) || `Property ${i + 1}`,
+            description: str(p.description) || NO_DATA,
+            fromIds: mapFrom(p.from, traits),
+            measure: str(p.measure),
+            value,
+            level: levels.includes(str(p.level)) ? str(p.level) : levelFromValue(value),
+            visual: str(p.visual) || "a professional editorial close-up that expresses this property through surface, light, depth or texture"
+          };
+        });
       }
 
       /* 지각 개수와 맥락은 AI가 사물에 맞게 결정합니다. */
-      function normPerception(p, i, props) {
-        p = p && typeof p === "object" ? p : {};
-        return {
+      function normPerceptions(raw, props) {
+        return arr(raw && raw.perceptions).filter(p => p && typeof p === "object").slice(0, 14).map((p, i) => ({
           id: uid("prc"),
           index: i + 1,
           moment: str(p.moment || p.category) || "지각",
@@ -1239,36 +1240,33 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           label: str(p.label) || str(p.titleEn) || `Perception ${i + 1}`,
           labelKo: str(p.labelKo) || str(p.titleKo) || `지각 ${i + 1}`,
           style: matchStyle(p.style, i)
-        };
-      }
-      function normPerceptions(raw, props) {
-        return arr(raw && raw.perceptions).slice(0, 14).map((p, i) => normPerception(p, i, props));
+        }));
       }
 
-      function normLayer(l, i, percs) {
-        l = l && typeof l === "object" ? l : {};
-        const n = Number(l.intensity);
-        return {
-          id: uid("emo"),
-          index: i + 1,
-          phase: str(l.category || l.phase) || "감성",
-          nameKo: str(l.nameKo) || `감성 ${i + 1}`,
-          nameEn: str(l.nameEn) || `Emotion ${i + 1}`,
-          description: str(l.description) || NO_DATA,
-          fromIds: mapFrom(l.from, percs),
-          intensity: Number.isFinite(n) && l.intensity !== "" && l.intensity !== null ? Math.max(0, Math.min(100, Math.round(n))) : 60,
-          visual: str(l.visual) || "a refined single-scene visual metaphor for this emotional quality",
-          label: str(l.label) || str(l.nameEn) || `Emotion ${i + 1}`,
-          labelKo: str(l.labelKo) || str(l.nameKo) || `감성 ${i + 1}`,
-          style: matchStyle(l.style, i)
-        };
+      function normLayers(rawItems, percs) {
+        return rawItems.filter(l => l && typeof l === "object")
+          .sort((a, b) => (Number(b.intensity) || 0) - (Number(a.intensity) || 0))
+          .slice(0, 2).map((l, i) => ({
+            id: uid("emo"),
+            index: i + 1,
+            phase: str(l.category || l.phase) || "감성",
+            nameKo: str(l.nameKo) || `감성 ${i + 1}`,
+            nameEn: str(l.nameEn) || `Emotion ${i + 1}`,
+            description: str(l.description) || NO_DATA,
+            fromIds: mapFrom(l.from, percs),
+            intensity: Math.max(0, Math.min(100, Math.round(Number(l.intensity) || 60))),
+            visual: str(l.visual) || "a refined single-scene visual metaphor for this emotional quality",
+            label: str(l.label) || str(l.nameEn) || `Emotion ${i + 1}`,
+            labelKo: str(l.labelKo) || str(l.nameKo) || `감성 ${i + 1}`,
+            style: matchStyle(l.style, i)
+          }));
       }
+
       function normEmotion(raw, percs) {
         const e = raw && raw.emotion && typeof raw.emotion === "object" ? raw.emotion : null;
         if (!e) return null;
-        const rawItems = (arr(e.emotions).length ? arr(e.emotions) : arr(e.layers)).slice();
-        rawItems.sort((a, b) => (Number(b && b.intensity) || 0) - (Number(a && a.intensity) || 0));
-        const layers = rawItems.slice(0, 2).map((l, i) => normLayer(l, i, percs));
+        const rawItems = arr(e.emotions).length ? arr(e.emotions) : arr(e.layers);
+        const layers = normLayers(rawItems.slice(), percs);
         if (!layers.length) return null;
         return {
           nameKo: str(e.nameKo) || "종합 감성",
@@ -1280,20 +1278,18 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         };
       }
 
-      /* 개별 수정 응답에서 항목 하나를 꺼냅니다. 모델이 형식을 조금 어겨도 받아 냅니다. */
-      function pickEditedItem(data) {
+      /* 부분 수정 응답에서 항목 하나를 꺼냅니다. 모델이 형식을 조금 어겨도 받아 냅니다. */
+      function pickItem(data, plural, singular) {
         if (!data || typeof data !== "object") return null;
-        if (data.item && typeof data.item === "object") return data.item;
-        if (Array.isArray(data.properties) && data.properties[0]) return data.properties[0];
-        if (Array.isArray(data.perceptions) && data.perceptions[0]) return data.perceptions[0];
-        if (data.emotion && Array.isArray(data.emotion.emotions) && data.emotion.emotions[0]) return data.emotion.emotions[0];
-        if (Array.isArray(data.emotions) && data.emotions[0]) return data.emotions[0];
+        if (data.item && typeof data.item === "object") return Array.isArray(data.item) ? data.item[0] : data.item;
+        const s = data[singular];
+        if (s && typeof s === "object" && !Array.isArray(s)) {
+          if (Array.isArray(s.emotions) && s.emotions.length) return s.emotions[0];
+          return s;
+        }
+        if (Array.isArray(data[plural]) && data[plural].length) return data[plural][0];
         if (data.titleKo || data.nameKo) return data;
         return null;
-      }
-      function idsToNums(ids, list) {
-        const set = new Set(ids || []);
-        return list.map((x, i) => (set.has(x.id) ? i + 1 : null)).filter(Boolean);
       }
 
       /* =========================================================
@@ -1327,7 +1323,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           properties: state.properties,
           perceptions: state.perceptions,
           emotion: state.emotion,
-          boardKind: state.boardKind,
+          synthesis: state.synthesis,
           createdAt: state.createdAt,
           step: Math.min(4, Math.max(1, state.step >= 1 ? state.step : lastWorkStep))
         };
@@ -1351,105 +1347,41 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       }
 
       let quotaWarned = false;
-      let lastSavedJson = "";
       function persist(showToast) {
-        if (!hasContent()) return "empty";
+        if (!hasContent()) {
+          if (showToast) toast("아직 저장할 내용이 없습니다.");
+          return Promise.resolve("empty");
+        }
+        if (!Store.ready) {
+          if (showToast) toast("저장소를 준비하고 있습니다. 잠시 후 다시 눌러 주세요.");
+          return Promise.resolve("pending");
+        }
+        /* 상태는 호출 순간에 복사해 두어야 이후 화면 변경과 섞이지 않습니다. */
         const snap = snapshot();
-        const sig = JSON.stringify(snap) + "|" + projectTitle();
-        if (sig === lastSavedJson && !showToast) return "ok";
-        const r = Store.save(snap, { id: state.projectId, title: projectTitle() });
-        if (r.ok) {
-          lastSavedJson = sig;
-          quotaWarned = false;
-          if (showToast) toast("진행 상태를 저장했습니다.");
-          if (r.pruned) toast("저장 공간이 부족해 가장 오래된 프로젝트를 정리했습니다.");
-          return "ok";
-        }
-        if (!quotaWarned) {
-          quotaWarned = true;
-          toast("저장 공간이 부족해 자동 저장이 중단되었습니다. 리포트를 PDF로 내려받아 주세요.", "error");
-        }
-        return "full";
-      }
-
-      /* 이미지를 IndexedDB에 data URL 문자열로 저장합니다. */
-      let imageSaveWarned = false;
-      async function storeImage(slot, dataUrl) {
-        const ok = await ImageDB.put(state.projectId, slot, dataUrl);
-        if (!ok && !imageSaveWarned) {
-          imageSaveWarned = true;
-          toast("이미지를 브라우저에 저장하지 못했습니다. 화면의 이미지는 남아 있으니 필요하면 내려받아 두세요.", "error");
-        }
-        return ok;
-      }
-
-      /* 다시 생성하면 해당 단계의 보드와 항목별 이미지를 화면과 저장소 양쪽에서 함께 지웁니다.
-         화면에서만 지우면 프로젝트를 다시 열 때 옛 이미지가 되살아납니다. */
-      function clearStages(stages) {
-        const images = Object.assign({}, state.images);
-        const items = Object.assign(blankItemImages(), state.itemImages);
-        const kinds = Object.assign({}, state.boardKind);
-        stages.forEach(s => {
-          images[s] = null;
-          items[s] = {};
-          delete kinds[s];
-          ImageDB.remove(state.projectId, s);
-          ImageDB.removePrefix(`${state.projectId}::item::${s}::`);
-        });
-        state.images = images;
-        state.itemImages = items;
-        state.boardKind = kinds;
-      }
-
-      async function setItemImage(stage, id, dataUrl) {
-        const items = Object.assign(blankItemImages(), state.itemImages);
-        items[stage] = Object.assign({}, items[stage], { [id]: dataUrl });
-        state.itemImages = items;
-        await storeImage(`item::${stage}::${id}`, dataUrl);
-      }
-      async function removeItemImage(stage, id) {
-        const items = Object.assign(blankItemImages(), state.itemImages);
-        items[stage] = Object.assign({}, items[stage]);
-        delete items[stage][id];
-        state.itemImages = items;
-        await ImageDB.remove(state.projectId, `item::${stage}::${id}`);
-      }
-
-      /* 항목별 이미지 생성 — 동시에 3장씩 만듭니다. 일부가 실패해도 성공한 것은 남깁니다. */
-      async function generateItemImages(stage, jobs, onProgress) {
-        const queue = jobs.slice();
-        const pid = state.projectId;
-        let done = 0, failed = 0, lastErr = "", fatal = false;
-        const worker = async () => {
-          while (queue.length) {
-            const job = queue.shift();
-            try {
-              const raw = await callImage(itemPrompt(stage, job.item, job.i), ITEM_IMAGE_SIZE[stage]);
-              const jpg = await toJpeg(raw, 0.88);
-              /* 생성 도중 다른 프로젝트로 바뀌었거나 항목이 다시 생성되었으면 버립니다. */
-              if (state.projectId === pid && stageItems(stage).some(it => it.id === job.item.id)) {
-                await setItemImage(stage, job.item.id, jpg);
-              }
-            } catch (err) {
-              if (err && err.aborted) { queue.length = 0; throw err; }
-              failed += 1;
-              lastErr = err && err.message ? err.message : "";
-              if (err && err.fatal) { failed += queue.length; queue.length = 0; fatal = true; }
-            }
-            done += 1;
-            if (onProgress) onProgress(done);
+        const meta = { id: state.projectId, title: projectTitle() };
+        return Store.save(snap, meta).then(r => {
+          if (r.ok) {
+            quotaWarned = false;
+            if (showToast) toast("진행 상태를 저장했습니다.");
+            if (r.freed && r.freed.length) toast(`저장 공간을 확보하려고 오래된 프로젝트 ${r.freed.length}개를 정리했습니다.`);
+            return "ok";
           }
-        };
-        await Promise.all(Array.from({ length: Math.min(3, jobs.length) }, worker));
-        return { failed, lastErr, fatal };
+          if (!quotaWarned || showToast) {
+            quotaWarned = true;
+            toast(r.full
+              ? "브라우저 저장 공간이 가득 차 이 프로젝트를 저장하지 못했습니다. PDF로 내려받아 보관해 주세요."
+              : "진행 상태를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.", "error");
+          }
+          return "full";
+        }).catch(e => { console.warn("자동 저장 실패", e); return "error"; });
       }
 
-      async function rebuildBoard(stage) {
-        const board = await composeBoard(stage);
-        if (!board) return;
-        state.images = Object.assign({}, state.images, { [stage]: board });
-        state.boardKind = Object.assign({}, state.boardKind, { [stage]: "items" });
-        await storeImage(stage, board);
+      /* 다시 생성하면 뒤 단계 이미지는 화면과 저장소 양쪽에서 함께 지웁니다.
+         화면에서만 지우면 프로젝트를 다시 열 때 옛 이미지가 되살아납니다. */
+      function clearImages(slots) {
+        const patch = {};
+        slots.forEach(s => { patch[s] = null; ImageDB.remove(state.projectId, s); });
+        state.images = Object.assign({}, state.images, patch);
       }
 
       /* =========================================================
@@ -1500,12 +1432,13 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           class="px-4 py-2.5 rounded-xl font-bold t-meta text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 active:scale-95 transition-all inline-flex items-center gap-1.5 flex-shrink-0">${icon ? `<i data-lucide="${icon}" class="w-4 h-4"></i>` : ""}${esc(label)}</button>`;
       }
 
-      /* 분석 결과 카드 — 선택 기능 없이 읽기 전용으로 보여 줍니다. */
+      /* 분석 결과 카드 — 수정 대상으로 고른 카드는 파란 테두리로 표시합니다. */
       function infoCard(opts) {
         const badge = opts.badge
           ? `<span class="t-meta font-bold px-2.5 py-1 rounded-lg flex-shrink-0 bg-slate-200 text-slate-700">${esc(opts.badge)}</span>`
           : "";
-        return `<article class="w-full p-5 rounded-[2rem] border-2 border-slate-200 bg-white shadow-md">
+        const border = opts.active ? "border-blue-700 ring-4 ring-blue-100" : "border-slate-200";
+        return `<article class="w-full p-5 rounded-[2rem] border-2 ${border} bg-white shadow-md transition-all">
           <div class="flex items-start gap-3 mb-3">
             <span class="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 font-bold t-meta tabular-nums bg-slate-900 text-white">${esc(pad2(opts.index))}</span>
             <div class="min-w-0 flex-1">
@@ -1527,90 +1460,77 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
       function imageCard(slot, opts) {
         const url = state.images ? state.images[slot] : null;
-        const items = stageItems(slot);
-        const legacy = isLegacyBoard(slot);
-        const missing = items.filter(it => !itemImg(slot, it.id)).length;
-        const inner = !url && state.imagesLoading
-          ? `<div class="w-full rounded-2xl bg-slate-100 px-5 py-12 text-center t-small text-slate-500">저장된 이미지를 불러오고 있습니다…</div>`
-          : url
+        const inner = url
           ? `<button type="button" onclick="Actions.openLightbox('${slot}')" class="block w-full" aria-label="${escAttr(opts.title)} 크게 보기">
                <img src="${escAttr(url)}" alt="${escAttr(opts.alt || "생성된 통합 이미지")}" class="w-full rounded-2xl bg-slate-100" />
              </button>`
           : `<div class="w-full rounded-2xl bg-slate-100 border-2 border-dashed border-slate-300 px-5 py-10 text-center">
                <i data-lucide="image" class="w-10 h-10 text-slate-400 mx-auto mb-3"></i>
                <p class="t-small text-slate-600 mb-4">${esc(opts.empty || "아직 이미지를 만들지 않았습니다.")}</p>
-               ${items.length ? ghostBtn(missing && missing < items.length ? `빠진 이미지 ${missing}개 만들기` : "이미지 만들기", `Actions.buildMissing('${slot}')`, "image-plus") : ""}
+               ${opts.onGenerate ? ghostBtn("이미지 만들기", opts.onGenerate, "image-plus") : ""}
              </div>`;
-        let repair = "";
-        if (url && !legacy && missing) {
-          repair = `<div class="mt-3 px-1">${ghostBtn(`빠진 이미지 ${missing}개 만들기`, `Actions.buildMissing('${slot}')`, "image-plus")}</div>`;
-        }
         return `<section class="bg-white rounded-[2rem] p-4 border-2 border-slate-200 shadow-md mb-6">
           <div class="flex items-center justify-between gap-2 mb-3 px-1">
             <h3 class="t-label text-slate-500">${esc(opts.title)}</h3>
             ${url ? ghostBtn("이미지 저장", `Actions.downloadImage('${slot}')`, "download") : ""}
           </div>
           ${inner}
-          ${repair}
           ${opts.caption ? `<p class="t-meta text-slate-500 mt-3 px-1 prose-ko">${esc(opts.caption)}</p>` : ""}
         </section>`;
       }
 
-      /* 수정 지시 — 항목 하나 또는 전체를 골라 다시 생성합니다.
-         항목 하나를 고르면 그 항목의 글과 보드의 해당 칸만 바뀌고 나머지는 그대로 남습니다. */
-      function editSelection(stage) {
-        const items = stageItems(stage);
-        const v = state.editSel ? state.editSel[stage] : undefined;
-        if (v === "all" || !items.length) return "all";
-        const n = Math.round(Number(v));
-        return n >= 1 && n <= items.length ? n : 1;
+      /* ---- 수정 지시 — 항목 하나 또는 전체를 골라 다시 생성합니다 ---- */
+      function currentTarget(key, items) {
+        const raw = drafts[`sel-${key}`];
+        if (raw === undefined || raw === "all") return "all";
+        const n = Number(raw);
+        return items.some(it => it.index === n) ? n : "all";
       }
 
-      function instructionBox(stage, placeholder) {
-        const id = `ins-${stage}`;
-        const items = stageItems(stage);
-        const sel = editSelection(stage);
-        const target = sel === "all" ? null : items[sel - 1];
-        const chipCls = on => on
-          ? "bg-blue-50 border-blue-700 text-blue-800"
-          : "bg-white border-slate-300 text-slate-600 hover:bg-slate-50";
-        const chips = items.map(it => `<button type="button" aria-pressed="${sel === it.index}" aria-label="${escAttr(pad2(it.index))}번 항목 선택"
-            onclick="Actions.pickEditTarget('${stage}', ${it.index})"
-            class="h-14 rounded-2xl border font-bold t-small tabular-nums transition-all active:scale-95 ${chipCls(sel === it.index)}">${esc(pad2(it.index))}</button>`).join("")
-          + `<button type="button" aria-pressed="${sel === "all"}" onclick="Actions.pickEditTarget('${stage}', 'all')"
-            class="h-14 rounded-2xl border font-bold t-small transition-all active:scale-95 ${chipCls(sel === "all")}">전체</button>`;
-        const downstream = stage !== "emotion" ? " 이후 단계 결과는 초기화됩니다." : "";
-        const desc = target
-          ? `${pad2(target.index)} · ${itemCaption(stage, target).ko}`
-          : `전체 ${items.length}개 항목과 이미지를 모두 다시 생성합니다.${downstream}`;
-        const btnLabel = target ? `${pad2(target.index)}번 항목만 수정` : "전체 다시 생성";
-        return `<section class="p-5 bg-slate-50 border-2 border-slate-200 rounded-[2rem] shadow-sm mt-8">
+      function instructionBox(key, items, opts) {
+        const id = `ins-${key}`;
+        const sel = currentTarget(key, items);
+        const selItem = sel === "all" ? null : items.find(it => it.index === sel);
+        const btn = (val, text, aria) => {
+          const on = String(val) === String(sel);
+          return `<button type="button" aria-pressed="${on}" aria-label="${escAttr(aria)}" onclick="Actions.pickEditTarget('${key}','${val}')"
+            class="h-14 rounded-2xl border font-bold t-small tabular-nums transition-all active:scale-95 ${on ? "bg-blue-50 border-blue-800 text-blue-900" : "bg-white border-slate-300 text-slate-700 hover:bg-slate-50"}">${esc(text)}</button>`;
+        };
+        const target = selItem
+          ? `${pad2(selItem.index)} · ${selItem[opts.titleKey]}`
+          : "전체 · 이 단계의 모든 항목을 다시 분석합니다";
+        return `<section class="mt-8 p-5 bg-slate-50 rounded-[2rem] border-2 border-slate-200 shadow-sm">
           <h3 class="t-h3 text-slate-600 mb-4">수정 지시</h3>
-          <h4 class="t-small font-bold text-slate-600 mb-2.5">수정할 항목</h4>
-          <div class="grid grid-cols-6 gap-2 mb-3" role="group" aria-label="수정할 항목 선택">${chips}</div>
-          <p class="t-small text-slate-700 mb-3 prose-ko">${esc(desc)}</p>
+          <h4 class="t-small font-bold text-slate-700 mb-2">수정할 항목</h4>
+          <div class="grid grid-cols-6 gap-2 mb-4" role="group" aria-label="수정할 항목 선택">
+            ${items.map(it => btn(it.index, pad2(it.index), `${pad2(it.index)}번 ${it[opts.titleKey]}`)).join("")}
+            ${btn("all", "전체", "전체 항목")}
+          </div>
+          <p class="t-small text-slate-800 mb-2 prose-ko">${esc(target)}</p>
+          ${!selItem && opts.downstreamNote ? `<p class="t-meta text-slate-500 mb-2 prose-ko">${esc(opts.downstreamNote)}</p>` : ""}
+          ${selItem ? `<p class="t-meta text-slate-500 mb-2 prose-ko">선택한 항목과 통합 이미지의 해당 칸만 바뀌고, 다른 항목은 그대로 유지됩니다.</p>` : ""}
           <label for="${id}" class="sr-only">수정 지시 입력</label>
-          <textarea id="${id}" rows="3" oninput="setDraft('${id}', this.value)"
-            class="w-full block min-w-0 bg-white border border-slate-300 rounded-2xl px-4 py-3.5 text-slate-800 t-small outline-none resize-none placeholder:text-slate-400 focus:border-blue-700 mb-3"
-            placeholder="${escAttr(placeholder)}">${esc(draft(id))}</textarea>
-          <button type="button" onclick="Actions.editItem('${stage}')"
-            class="w-full py-4 rounded-2xl bg-white border-2 border-slate-300 text-slate-800 font-bold t-small flex items-center justify-center gap-2 hover:bg-slate-100 active:scale-[0.98] transition-all">
-            <i data-lucide="send" class="w-5 h-5"></i>${esc(btnLabel)}
+          <textarea id="${id}" rows="4" oninput="setDraft('${id}', this.value)"
+            class="w-full block min-w-0 mt-2 bg-white border border-slate-300 rounded-2xl px-4 py-3.5 text-slate-900 t-small outline-none resize-none placeholder:text-slate-400 focus:border-blue-700 mb-4"
+            placeholder="${escAttr(opts.placeholder)}">${esc(draft(id))}</textarea>
+          <button type="button" onclick="Actions.applyEdit('${key}')"
+            class="w-full py-4 rounded-2xl bg-white border-2 border-slate-300 hover:bg-slate-100 text-slate-800 font-bold t-small flex items-center justify-center gap-2 active:scale-[0.98] transition-all">
+            <i data-lucide="send" class="w-5 h-5"></i>${selItem ? `${esc(pad2(selItem.index))}번 항목만 수정` : "전체 다시 생성"}
           </button>
         </section>`;
       }
 
       /* 다음 단계 결과가 이미 있으면 다시 생성하지 않고 그 단계로 이동합니다.
-         다시 만들고 싶을 때는 각 단계의 'AI 수정 지시'를 씁니다. */
-      /* 하단 버튼은 항상 다음 단계를 새로 분석합니다. 지난 결과는 상단 좌우 꺽쇠로 오갑니다. */
-      function nextDock(nextStep, label) {
-        return dock(primaryBtn(label, `Actions.runNext(${nextStep})`));
+         다시 만들고 싶을 때는 각 단계의 '수정 지시'를 씁니다. */
+      function nextDock(nextStep, generateLabel, generateAction, extra) {
+        const ready = stepReady(nextStep);
+        const stage = STAGES.find(x => x.n === nextStep);
+        return dock(`${extra || ""}${ready
+          ? primaryBtn(`${stage.label} 보기`, `setState({step:${nextStep}}, true)`)
+          : primaryBtn(generateLabel, generateAction)}`);
       }
 
       /* 카드 번호와 같은 번호로 적어야 화면에서 근거를 바로 찾을 수 있습니다. */
-      function joinTitles(items, key) {
-        return items.map(it => `${pad2(it.index)} ${it[key]}`).join("   ");
-      }
       function sourceTitles(ids, list, key) {
         return list.filter(x => (ids || []).includes(x.id)).map(x => `${pad2(x.index)} ${x[key]}`).join(", ");
       }
@@ -1641,10 +1561,6 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           L.push(`${o.nameKo} · ${o.kind}`, `  ${o.summary}`);
           if (o.specimen) L.push(`  기준 표본: ${o.specimen}`);
           if (o.palette.length) L.push(`  관찰 색: ${o.palette.map(p => `${p.name || p.role} ${p.hex}`).join(", ")}`);
-          state.traits.forEach(t => {
-            L.push("", `${pad2(t.index)}. [${t.category}] ${t.titleKo} / ${t.titleEn} · ${t.certainty}`);
-            L.push(`  ${t.observation}`);
-          });
           L.push("");
         }
         if (state.properties.length) {
@@ -1705,15 +1621,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           return PDF.blk(`<img src="${escAttr(url)}" style="width:${width || 520}px;display:block;margin:0 auto 8px;border:1px solid #e2e8f0;" />
             <p style="font-size:14px;color:#64748b;text-align:center;margin:0;">${esc(caption)}</p>`);
         },
-        /* 항목별 이미지가 있으면 카드 안에 함께 넣습니다. ratio > 1 이면 가로형(감성)이라 위에 크게 둡니다. */
-        card(inner, img, ratio) {
-          if (img && ratio > 1) {
-            inner = `<img src="${escAttr(img)}" style="width:100%;display:block;border-radius:10px;margin-bottom:12px;" />${inner}`;
-          } else if (img) {
-            inner = `<div style="display:flex;gap:18px;align-items:flex-start;">
-              <img src="${escAttr(img)}" style="width:170px;height:170px;flex-shrink:0;border-radius:10px;border:1px solid #e2e8f0;" />
-              <div style="flex:1;min-width:0;">${inner}</div></div>`;
-          }
+        card(inner) {
           return PDF.blk(`<div style="border:1px solid #cbd5e1;border-radius:14px;padding:16px 18px;">${inner}</div>`, "0 0 10px 0");
         },
         kv(k, v) {
@@ -1751,7 +1659,6 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             <div style="font-size:14px;letter-spacing:0.12em;color:#64748b;font-weight:700;">OBJECT EXPERIENCE LAB</div>
             <h1 style="font-size:30px;font-weight:800;margin:6px 0 10px;letter-spacing:-0.02em;">사물 · 물성 · 지각 · 감성 리포트</h1>
             <div style="font-size:20px;font-weight:700;">${esc(objectName() || "분석 사물 없음")}${o && o.nameEn ? ` <span style="font-size:16px;color:#64748b;font-weight:400;">${esc(o.nameEn)}</span>` : ""}</div>
-            
             ${state.note ? `<div style="font-size:16px;color:#475569;margin-top:4px;">${esc(state.note)}</div>` : ""}
             <div style="font-size:14px;color:#64748b;margin-top:6px;">분석 기준 · 대부분의 사람이 일상에서 이 사물을 마주하는 보편적 상황</div>
             <div style="font-size:14px;color:#94a3b8;margin-top:10px;">${esc(nowLabel(Date.now()))}</div>
@@ -1765,17 +1672,11 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
               <div style="font-size:16px;line-height:1.75;margin-top:8px;white-space:pre-line;">${esc(o.summary)}</div>
               ${PDF.meta("기준 표본", o.specimen)}
               ${PDF.palette(o.palette)}`));
-            state.traits.forEach(t => {
-              out.push(PDF.card(`
-                <div style="font-size:17px;font-weight:800;">${pad2(t.index)}  ${esc(t.titleKo)}
-                  <span style="font-size:14px;color:#64748b;font-weight:700;margin-left:6px;">${esc(t.category)} · ${esc(t.certainty)}</span></div>
-                <div style="font-size:15px;line-height:1.7;margin-top:6px;white-space:pre-line;">${esc(t.observation)}</div>`));
-            });
           }
 
           if (state.properties.length) {
             out.push(PDF.heading("02", "물성 분석", "Physical Properties"));
-            if (isLegacyBoard("property")) out.push(PDF.image("property", "물성 통합 이미지"));
+            out.push(PDF.image("property", "물성 통합 이미지"));
             state.properties.forEach(p => {
               out.push(PDF.card(`
                 <div style="font-size:18px;font-weight:800;">${pad2(p.index)}  ${esc(p.titleKo)}
@@ -1785,13 +1686,13 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
                 ${PDF.bar(p.value)}
                 <div style="font-size:14px;color:#64748b;">추정 수준 · ${esc(p.level)} (${esc(p.value)})</div>
                 ${PDF.meta("측정·확인", p.measure)}
-                ${PDF.meta("근거 사물 특징", sourceTitles(p.fromIds, state.traits, "titleKo"))}`, itemImg("property", p.id), 1));
+                ${PDF.meta("근거 사물 특징", sourceTitles(p.fromIds, state.traits, "titleKo"))}`));
             });
           }
 
           if (state.perceptions.length) {
             out.push(PDF.heading("03", "지각 분석", "Perception in Experience"));
-            if (isLegacyBoard("perception")) out.push(PDF.image("perception", "지각 분석 통합 이미지"));
+            out.push(PDF.image("perception", "지각 분석 통합 이미지"));
             state.perceptions.forEach(p => {
               out.push(PDF.card(`
                 <div style="font-size:18px;font-weight:800;">${pad2(p.index)}  ${esc(p.titleKo)}
@@ -1800,7 +1701,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
                 ${PDF.meta("상황", p.situation)}
                 <div style="font-size:16px;line-height:1.75;margin-top:8px;white-space:pre-line;">${esc(p.description)}</div>
                 ${PDF.meta("관찰 단서", p.cue)}
-                ${PDF.meta("근거 물성", sourceTitles(p.fromIds, state.properties, "titleKo"))}`, itemImg("perception", p.id), 1));
+                ${PDF.meta("근거 물성", sourceTitles(p.fromIds, state.properties, "titleKo"))}`));
             });
           }
 
@@ -1813,7 +1714,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
               <div style="font-size:16px;line-height:1.75;margin-top:8px;white-space:pre-line;">${esc(e.definition)}</div>
               ${e.moodWords.length ? `<div style="font-size:15px;color:${PDF.ACCENT};font-weight:700;margin-top:8px;">${esc(e.moodWords.join(" · "))}</div>` : ""}
               ${PDF.kv("지각에서 온 근거", e.trace)}`));
-            if (isLegacyBoard("emotion")) out.push(PDF.image("emotion", "주요 감성 통합 이미지"));
+            out.push(PDF.image("emotion", "주요 감성 통합 이미지"));
             e.layers.forEach(l => {
               out.push(PDF.card(`
                 <div style="font-size:18px;font-weight:800;">${pad2(l.index)}  ${esc(l.nameKo)}
@@ -1821,7 +1722,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
                 <div style="font-size:15px;color:#64748b;">${esc(l.nameEn)}</div>
                 <div style="font-size:16px;line-height:1.75;margin-top:8px;white-space:pre-line;">${esc(l.description)}</div>
                 ${PDF.meta("상대 강도", `${l.intensity}/100`)}
-                ${PDF.meta("근거 지각", sourceTitles(l.fromIds, state.perceptions, "titleKo"))}`, itemImg("emotion", l.id), 1.5));
+                ${PDF.meta("근거 지각", sourceTitles(l.fromIds, state.perceptions, "titleKo"))}`));
             });
           }
 
@@ -1877,6 +1778,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
           for (const b of Array.from(holder.children)) {
             const canvas = await h2c(b, { scale: 2, backgroundColor: "#ffffff", useCORS: true, logging: false });
+            if (!canvas.width || !canvas.height) continue;
             let w = maxW;
             let h = canvas.height * maxW / canvas.width;
             if (h > maxH) { h = maxH; w = canvas.width * maxH / canvas.height; }
@@ -1906,7 +1808,61 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       }
 
       /* =========================================================
-         14. ACTIONS
+         14. 단계별 수정 설정
+         단계 이름(key)은 이미지 저장 슬롯 이름과 같습니다.
+         ========================================================= */
+      const EDIT = {
+        property: {
+          label: "물성",
+          plural: "properties", singular: "property",
+          list: () => state.properties,
+          photo: true,
+          downstream: () => state.perceptions.length > 0,
+          downstreamText: "전체를 다시 생성하면 지각·감성 분석 결과가 지워집니다.",
+          regenerateAll: ins => Actions.generateProperties(ins),
+          prompt: (idx, ins) => PROMPTS.PROPERTY(state.object, state.traits, !!state.images.source, "")
+            + singleEditBlock("물성", listProperties(state.properties), idx, ins, EDIT_FORMAT.property),
+          norm: raw => normProperties({ properties: [raw] }, state.traits)[0] || null,
+          replace: (idx, item) => { state.properties = state.properties.map(p => p.index === idx ? item : p); }
+        },
+        perception: {
+          label: "지각",
+          plural: "perceptions", singular: "perception",
+          list: () => state.perceptions,
+          photo: false,
+          downstream: () => !!state.emotion,
+          downstreamText: "전체를 다시 생성하면 감성 분석 결과가 지워집니다.",
+          regenerateAll: ins => Actions.generatePerceptions(ins),
+          prompt: (idx, ins) => PROMPTS.PERCEPTION(state.object, state.properties, "")
+            + singleEditBlock("지각", listPerceptions(state.perceptions), idx, ins, EDIT_FORMAT.perception),
+          /* 스타일 기본값이 원래 순번을 따르도록 앞자리를 채워 정규화합니다. */
+          norm: raw => {
+            const list = normPerceptions({ perceptions: [raw] }, state.properties);
+            return list[0] || null;
+          },
+          replace: (idx, item) => { state.perceptions = state.perceptions.map(p => p.index === idx ? item : p); }
+        },
+        emotion: {
+          label: "감성",
+          plural: "emotions", singular: "emotion",
+          list: () => (state.emotion ? state.emotion.layers : []),
+          photo: false,
+          downstream: () => false,
+          downstreamText: "",
+          regenerateAll: ins => Actions.generateEmotion(ins),
+          prompt: (idx, ins) => PROMPTS.EMOTION(state.object, state.perceptions, "")
+            + singleEditBlock("감성", listEmotions(state.emotion.layers), idx, ins, EDIT_FORMAT.emotion),
+          norm: raw => normLayers([raw], state.perceptions)[0] || null,
+          replace: (idx, item) => {
+            state.emotion = Object.assign({}, state.emotion, {
+              layers: state.emotion.layers.map(l => l.index === idx ? item : l)
+            });
+          }
+        }
+      };
+
+      /* =========================================================
+         15. ACTIONS
          ========================================================= */
       const Actions = {
         /* ---- 접속 / 프로젝트 ---- */
@@ -1920,32 +1876,21 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           setState({ step: 0, errorMsg: null }, true);
         },
         pickQuality(id) { state.quality = id; saveSession(); render(); },
-        async pickLabelLang(id) {
-          if (state.labelLang === id) return;
-          state.labelLang = id;
-          saveSession();
-          render();
-          /* 라벨은 앱이 그리므로 이미 만든 보드도 API 호출 없이 바로 다시 그립니다. */
-          for (const s of Object.keys(BOARD_STAGES)) {
-            if (state.boardKind && state.boardKind[s] === "items" && stageItems(s).length) {
-              try { await rebuildBoard(s); } catch (e) { console.warn(e); }
-            }
-          }
-          render();
-        },
+        pickLabelLang(id) { state.labelLang = id; saveSession(); render(); },
+        toggleSettings() { setState({ settingsOpen: !state.settingsOpen }); },
 
         startNewProject() {
           persist(false);
           Object.assign(state, blankProject());
-          lastSavedJson = "";
-          Object.keys(drafts).forEach(k => { delete drafts[k]; });
+          drafts["keyword-input"] = "";
+          drafts["note-input"] = "";
+          resetEditDrafts();
           setState({ step: 1 }, true);
         },
 
         async openProject(id) {
-          if (state.isAnalyzing) return;
           const row = Store.list().find(p => p.id === id);
-          if (!row || !row.data) { toast("프로젝트를 찾지 못했습니다.", "error"); render(); return; }
+          if (!row || !row.data) { toast("프로젝트를 찾지 못했습니다.", "error"); return; }
           persist(false);
           const d = row.data;
           Object.assign(state, blankProject(), {
@@ -1957,55 +1902,32 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             traits: arr(d.traits),
             properties: arr(d.properties),
             perceptions: arr(d.perceptions),
-            emotion: d.emotion && Array.isArray(d.emotion.layers) ? d.emotion : null,
-            boardKind: d.boardKind && typeof d.boardKind === "object" ? d.boardKind : {},
+            emotion: d.emotion && arr(d.emotion.layers).length ? d.emotion : null,
+            synthesis: d.synthesis || null,
             createdAt: d.createdAt || row.savedAt
           });
-          /* 이전 버전 데이터의 감성 항목에는 id가 없어 개별 수정용 id를 붙입니다. */
-          if (state.emotion) state.emotion.layers.forEach(l => { if (!l.id) l.id = uid("emo"); });
-          Object.keys(drafts).forEach(k => { delete drafts[k]; });
           drafts["keyword-input"] = state.keyword;
-          const pid = state.projectId;
+          drafts["note-input"] = state.note;
+          resetEditDrafts();
           let step = Math.min(Math.max(1, d.step || 1), STAGES.length);
           while (step > 1 && !stepReady(step)) step -= 1;
-          /* 글은 저장된 그대로 보여 주고, 이미지는 불러오는 동안 '불러오는 중'으로 표시합니다. */
-          lastSavedJson = "";
-          setState({ step, imagesLoading: true }, true);
-          const loaded = await ImageDB.loadAll(pid);
-          if (state.projectId !== pid) return;
-          /* 데이터가 없는 단계의 이미지는 복원하지 않고 정리합니다. (참고 프로그램과 같은 처리) */
-          const orphan = Object.keys(BOARD_STAGES).filter(s => !stageItems(s).length);
-          orphan.forEach(s => {
-            if (loaded.images[s]) { loaded.images[s] = null; ImageDB.remove(pid, s); }
-            if (Object.keys(loaded.itemImages[s] || {}).length) { loaded.itemImages[s] = {}; ImageDB.removePrefix(`${pid}::item::${s}::`); }
-          });
-          state.images = loaded.images;
-          state.itemImages = loaded.itemImages;
-          let restored = 0;
-          for (const stage of Object.keys(BOARD_STAGES)) {
-            const items = stageItems(stage);
-            const hasItemImg = items.some(it => itemImg(stage, it.id));
-            if (items.length && hasItemImg && !state.images[stage]) {
-              try { await rebuildBoard(stage); restored += 1; } catch (e) { console.warn("보드 복원 실패", stage, e); }
-              if (state.projectId !== pid) return;
-            }
-          }
-          setState({ imagesLoading: false });
-          if (restored) persist(false);
-          if (loaded.failed) toast("저장된 이미지를 불러오지 못했습니다. 분석 내용은 그대로 남아 있습니다.", "error");
-          else if (d.hasPhoto && !loaded.images.source) toast("저장된 사진을 찾지 못했습니다. 분석 내용은 그대로 남아 있습니다.", "error");
+          setState({ step }, true);
+          const imgs = await ImageDB.loadAll(state.projectId);
+          if (state.projectId !== (d.projectId || row.id)) return; /* 그 사이 다른 프로젝트를 열었으면 무시 */
+          setState({ images: imgs });
+          if (d.hasPhoto && !imgs.source) toast("저장된 사진을 불러오지 못했습니다. 분석 결과는 그대로 남아 있습니다.", "error");
         },
 
         async deleteProject(id) {
           if (!window.confirm("이 프로젝트와 사진, 생성된 이미지를 모두 지웁니다. 계속할까요?")) return;
-          Store.remove(id);
-          if (state.projectId === id) { Object.assign(state, blankProject()); lastSavedJson = ""; }
+          await Store.remove(id);
+          if (state.projectId === id) { Object.assign(state, blankProject()); resetEditDrafts(); }
           toast("프로젝트를 삭제했습니다.");
           render();
         },
 
         goHome() { persist(false); setState({ step: 0 }, true); },
-        saveNow() { const r = persist(true); if (r === "empty") toast("아직 저장할 내용이 없습니다."); },
+        saveNow() { persist(true); },
 
         copyReport() { copyText(buildReport(), "리포트를 클립보드에 복사했습니다.", "cmf-reverse-report.txt"); },
         async exportPdf() {
@@ -2028,46 +1950,28 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         downloadImage(slot) {
           const url = state.images[slot];
           if (!url) return;
-          const ext = /^data:image\/png/i.test(url) ? "png" : "jpg";
+          const ext = /^data:image\/jpe?g/i.test(url) ? "jpg" : "png";
           const a = document.createElement("a");
           a.href = url;
           a.download = `cmf-reverse-${slot}-${Date.now()}.${ext}`;
           document.body.appendChild(a); a.click(); document.body.removeChild(a);
         },
-        async saveImage(slot, dataUrl) {
-          state.images = Object.assign({}, state.images, { [slot]: dataUrl });
-          await storeImage(slot, dataUrl);
+        async saveImage(slot, url) {
+          const projectId = state.projectId;
+          const stored = slot === "source" ? url : await toStorableImage(url);
+          if (state.projectId !== projectId) return;
+          state.images = Object.assign({}, state.images, { [slot]: stored });
+          const ok = await ImageDB.put(projectId, slot, stored);
+          if (!ok) toast("이미지를 기기에 저장하지 못했습니다. 지금 화면에서는 그대로 쓸 수 있습니다.", "error");
         },
 
-        /* 항목별 이미지를 만들고 보드를 다시 그립니다. ids가 없으면 모든 항목을 만듭니다. */
-        async buildStageImages(stage, ids) {
-          const items = stageItems(stage);
-          if (!items.length) return;
-          const jobs = items.map((item, i) => ({ item, i })).filter(j => !ids || ids.includes(j.item.id));
-          const base = `${STAGE_LABEL[stage]} 이미지를 만들고 있습니다`;
-          const res = await withLoading(jobs.length ? `${base} (0/${jobs.length})` : "보드를 정리하고 있습니다", async () => {
-            const r = jobs.length
-              ? await generateItemImages(stage, jobs, done => { state.loadingMsg = `${base} (${done}/${jobs.length})`; render(); })
-              : { failed: 0, lastErr: "" };
-            await rebuildBoard(stage);
-            return r;
-          });
-          persist(false);
-          render();
-          if (res && res.fatal) {
-            persist(false);
-            setState({ step: -1, errorMsg: res.lastErr || "API 키를 다시 확인해 주세요." }, true);
-            return;
-          }
-          if (res && res.failed) {
-            setState({ errorMsg: `이미지 ${res.failed}장을 만들지 못했습니다. 이미지 칸의 '빠진 이미지 만들기'로 다시 시도해 주세요.${res.lastErr ? `\n(${res.lastErr})` : ""}` });
-          }
-        },
-        async buildMissing(stage) {
-          const ids = stageItems(stage).filter(it => !itemImg(stage, it.id)).map(it => it.id);
-          await Actions.buildStageImages(stage, ids);
-        },
         /* ---- 1단계 : 사물 입력 ---- */
+        pickSample(i) {
+          const w = SAMPLE_OBJECTS[i];
+          if (!w) return;
+          setDraft("keyword-input", w);
+          render();
+        },
         async onPhotoPicked(input) {
           const file = input && input.files && input.files[0];
           if (!file) return;
@@ -2083,37 +1987,35 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           }
         },
         removePhoto() {
-          state.images = Object.assign({}, state.images, { source: null });
-          ImageDB.remove(state.projectId, "source");
+          clearImages(["source"]);
           render();
         },
 
-        /* 하단 버튼은 항상 다음 단계를 새로 분석합니다. 지난 결과를 보기만 할 때는 상단 좌우 꺽쇠를 씁니다.
-           이미 결과가 있으면 지워지는 범위를 알려 주고 확인을 받습니다. */
-        async runNext(n) {
-          if (state.isAnalyzing) return;
-          const names = { 2: "물성·지각·감성", 3: "지각·감성", 4: "감성" };
-          if (stepReady(n) && !window.confirm(`이미 분석한 결과가 있습니다. 새로 분석하면 기존 ${names[n]} 결과와 이미지가 새로 만들어집니다. 계속할까요?`)) return;
-          if (n === 2) await Actions.generateObject();
-          else if (n === 3) await Actions.generatePerceptions();
-          else if (n === 4) await Actions.generateEmotion();
+        /* 이미 결과가 있는 프로젝트에서 입력을 바꿔 처음부터 다시 분석합니다. */
+        restartAnalysis() {
+          if (state.properties.length && !window.confirm("지금까지의 물성·지각·감성 결과를 지우고 새 입력으로 다시 분석합니다. 계속할까요?")) return;
+          resetEditDrafts();
+          Actions.generateObject();
         },
 
         /* ---- 1단계 실행 : 사물 특징을 내부 분석한 뒤 바로 물성 분석으로 이동 ---- */
-        async generateObject() {
+        async generateObject(instruction) {
           const kw = (drafts["keyword-input"] !== undefined ? drafts["keyword-input"] : state.keyword).trim();
+          const note = (drafts["note-input"] !== undefined ? drafts["note-input"] : state.note).trim();
           const photo = state.images.source;
-          if (!kw && !photo) { setState({ errorMsg: "사진을 찍거나 올리고, 사진이 없으면 사물 키워드를 입력해 주세요." }); return; }
+          if (!kw && !photo) { setState({ errorMsg: "사진을 찍거나 올리고, 사진이 없으면 사물 키워드를 입력해 주세요." }); return false; }
           state.keyword = kw;
+          state.note = note;
 
           const data = await withLoading(photo ? "사진 속 사물의 전체 특징을 분석하고 있습니다" : "사물의 전체 특징을 분석하고 있습니다", () =>
-            callText(SYSTEM, PROMPTS.OBJECT(kw, state.note, !!photo, ""), photo));
-          if (!data) return;
+            callText(SYSTEM, PROMPTS.OBJECT(kw, note, !!photo, instruction || ""), photo));
+          if (!data) return false;
 
           const traits = normTraits(data);
-          if (!traits.length) { setState({ errorMsg: "사물 특징 분석을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          if (!traits.length) { setState({ errorMsg: "사물 특징 분석을 받지 못했습니다. 다시 시도해 주세요." }); return false; }
 
-          clearStages(["property", "perception", "emotion"]);
+          clearImages(["cmf", "property", "perception", "emotion"]);
+          resetEditDrafts();
           setState({
             object: normObject(data, kw),
             hasPhoto: !!photo,
@@ -2121,159 +2023,192 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             properties: [],
             perceptions: [],
             emotion: null,
-            editSel: {},
+            synthesis: null,
             step: 1
           }, true);
           persist(false);
-          await Actions.generateProperties();
+          return Actions.generateProperties();
         },
 
-        /* ---- 2단계 : 물성 분석 (전체) ---- */
+        /* ---- 2단계 : 물성 분석 ---- */
         async generateProperties(instruction) {
           const o = state.object;
-          if (!o || !state.traits.length) { setState({ errorMsg: "사물 특징 분석을 먼저 진행해 주세요." }); return; }
+          if (!o || !state.traits.length) { setState({ errorMsg: "사물 특징 분석을 먼저 진행해 주세요." }); return false; }
           const photo = state.images.source;
 
           const data = await withLoading("사물의 특징에서 중요한 물성을 읽어 내고 있습니다", () =>
             callText(SYSTEM, PROMPTS.PROPERTY(o, state.traits, !!photo, instruction || ""), photo));
-          if (!data) return;
+          if (!data) return false;
 
           const properties = normProperties(data, state.traits);
-          if (!properties.length) { setState({ errorMsg: "물성 분석을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          if (!properties.length) { setState({ errorMsg: "물성 분석을 받지 못했습니다. 다시 시도해 주세요." }); return false; }
 
-          clearStages(["property", "perception", "emotion"]);
-          state.editSel = {};
-          setState({ properties, perceptions: [], emotion: null, step: 2 }, true);
+          clearImages(["property", "perception", "emotion"]);
+          ["perception", "emotion"].forEach(k => { delete drafts[`ins-${k}`]; delete drafts[`sel-${k}`]; });
+          setState({ properties, perceptions: [], emotion: null, synthesis: null, step: 2 }, true);
           persist(false);
-          await Actions.buildStageImages("property", null);
+          await Actions.generatePropertyImage();
+          return true;
+        },
+        async generatePropertyImage() {
+          if (!state.properties.length) return false;
+          const url = await withLoading("물성 통합 이미지를 만들고 있습니다", () =>
+            callImage(IMG.property(state.properties)));
+          if (!url) return false;
+          await Actions.saveImage("property", url);
+          render();
+          return true;
         },
 
-        /* ---- 3단계 : 지각 분석 (전체) ---- */
+        /* ---- 3단계 : 지각 분석 ---- */
         async generatePerceptions(instruction) {
           const o = state.object;
-          if (!o || !state.properties.length) { setState({ errorMsg: "물성 분석을 먼저 진행해 주세요." }); return; }
+          if (!o || !state.properties.length) { setState({ errorMsg: "물성 분석을 먼저 진행해 주세요." }); return false; }
 
           const data = await withLoading("사람이 무엇을 지각하게 되는지 정리하고 있습니다", () =>
             callText(SYSTEM, PROMPTS.PERCEPTION(o, state.properties, instruction || "")));
-          if (!data) return;
+          if (!data) return false;
 
           const perceptions = normPerceptions(data, state.properties);
-          if (!perceptions.length) { setState({ errorMsg: "지각 분석을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          if (!perceptions.length) { setState({ errorMsg: "지각 분석을 받지 못했습니다. 다시 시도해 주세요." }); return false; }
 
-          clearStages(["perception", "emotion"]);
-          state.editSel = Object.assign({}, state.editSel, { perception: undefined, emotion: undefined });
-          setState({ perceptions, emotion: null, step: 3 }, true);
+          clearImages(["perception", "emotion"]);
+          delete drafts["ins-emotion"]; delete drafts["sel-emotion"];
+          setState({ perceptions, emotion: null, synthesis: null, step: 3 }, true);
           persist(false);
-          await Actions.buildStageImages("perception", null);
+          await Actions.generatePerceptionImage();
+          return true;
+        },
+        async generatePerceptionImage() {
+          if (!state.perceptions.length) return false;
+          const url = await withLoading("지각 분석 통합 이미지를 만들고 있습니다", () =>
+            callImage(IMG.perception(state.perceptions)));
+          if (!url) return false;
+          await Actions.saveImage("perception", url);
+          render();
+          return true;
         },
 
-        /* ---- 4단계 : 감성 분석 (전체) ---- */
+        /* ---- 4단계 : 감성 분석 ---- */
         async generateEmotion(instruction) {
           const o = state.object;
-          if (!o || !state.perceptions.length) { setState({ errorMsg: "지각 분석을 먼저 진행해 주세요." }); return; }
+          if (!o || !state.perceptions.length) { setState({ errorMsg: "지각 분석을 먼저 진행해 주세요." }); return false; }
 
           const data = await withLoading("지각이 어떤 감성으로 이어지는지 분석하고 있습니다", () =>
             callText(SYSTEM, PROMPTS.EMOTION(o, state.perceptions, instruction || "")));
-          if (!data) return;
+          if (!data) return false;
 
           const emotion = normEmotion(data, state.perceptions);
-          if (!emotion) { setState({ errorMsg: "감성 분석을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+          if (!emotion) { setState({ errorMsg: "감성 분석을 받지 못했습니다. 다시 시도해 주세요." }); return false; }
 
-          clearStages(["emotion"]);
-          state.editSel = Object.assign({}, state.editSel, { emotion: undefined });
-          setState({ emotion, step: 4 }, true);
+          clearImages(["emotion"]);
+          setState({ emotion, synthesis: null, step: 4 }, true);
           persist(false);
-          await Actions.buildStageImages("emotion", null);
+          await Actions.generateEmotionImage();
+          return true;
+        },
+        async generateEmotionImage() {
+          if (!state.emotion || !state.emotion.layers.length) return false;
+          const url = await withLoading("주요 감성 통합 이미지를 만들고 있습니다", () =>
+            callImage(IMG.emotion(state.emotion)));
+          if (!url) return false;
+          await Actions.saveImage("emotion", url);
+          render();
+          return true;
         },
 
-        /* ---- 수정 지시 ---- */
-        pickEditTarget(stage, v) {
-          state.editSel = Object.assign({}, state.editSel, { [stage]: v });
+        /* ---- 수정 지시 : 항목 선택 / 실행 ---- */
+        pickEditTarget(key, val) {
+          drafts[`sel-${key}`] = val === "all" ? "all" : Number(val);
           render();
         },
 
-        async editItem(stage) {
-          const items = stageItems(stage);
-          if (!items.length) return;
-          const insId = `ins-${stage}`;
+        async applyEdit(key) {
+          const cfg = EDIT[key];
+          if (!cfg || state.isAnalyzing) return;
+          const items = cfg.list();
+          const insId = `ins-${key}`;
           const ins = draft(insId).trim();
-          const sel = editSelection(stage);
-
-          /* 전체 다시 생성 — 이후 단계는 근거가 바뀌므로 초기화합니다. */
-          if (sel === "all") {
-            const hasDownstream = (stage === "property" && state.perceptions.length) || (stage === "perception" && state.emotion);
-            if (hasDownstream && !window.confirm("전체를 다시 생성하면 이후 단계 결과와 이미지가 지워집니다. 계속할까요?")) return;
-            drafts[insId] = "";
-            if (stage === "property") await Actions.generateProperties(ins);
-            else if (stage === "perception") await Actions.generatePerceptions(ins);
-            else await Actions.generateEmotion(ins);
-            return;
-          }
-
-          /* 개별 수정 — 선택한 항목 하나만 바꾸고 나머지는 객체 그대로 둡니다. */
-          const target = items[sel - 1];
-          if (!target) return;
-          const o = state.object;
-          const others = items.filter(it => it.id !== target.id);
-          let prompt, photo = null;
-          if (stage === "property") {
-            photo = state.images.source;
-            prompt = itemEditPrompt(PROMPTS.PROPERTY(o, state.traits, !!photo, ""), "물성 분석", listProperties(others), target, {
-              axis: target.axis, titleKo: target.titleKo, titleEn: target.titleEn, description: target.description,
-              from: idsToNums(target.fromIds, state.traits), measure: target.measure, value: target.value,
-              level: target.level, visual: target.visual
-            }, ins);
-          } else if (stage === "perception") {
-            prompt = itemEditPrompt(PROMPTS.PERCEPTION(o, state.properties, ""), "지각 분석", listPerceptions(others), target, {
-              moment: target.moment, situation: target.situation, titleKo: target.titleKo, titleEn: target.titleEn,
-              description: target.description, from: idsToNums(target.fromIds, state.properties), cue: target.cue,
-              visual: target.visual, label: target.label, labelKo: target.labelKo, style: target.style
-            }, ins);
+          const target = currentTarget(key, items);
+          let ok = false;
+          if (target === "all") {
+            if (cfg.downstream() && !window.confirm(`${cfg.downstreamText} 계속할까요?`)) return;
+            ok = await cfg.regenerateAll(ins);
+            if (ok) drafts[`sel-${key}`] = "all";
           } else {
-            prompt = itemEditPrompt(PROMPTS.EMOTION(o, state.perceptions, ""), "감성 분석",
-              others.map(l => `${l.index}. [${l.phase}] ${l.nameKo} (${l.nameEn}) — ${l.description}`).join("\n"), target, {
-                category: target.phase, nameKo: target.nameKo, nameEn: target.nameEn, description: target.description,
-                from: idsToNums(target.fromIds, state.perceptions), intensity: target.intensity,
-                visual: target.visual, label: target.label, labelKo: target.labelKo, style: target.style
-              }, ins);
+            ok = await Actions.editOne(key, target, ins);
           }
+          if (ok) { drafts[insId] = ""; render(); }
+        },
 
-          const data = await withLoading(`${pad2(target.index)}번 항목을 다시 작성하고 있습니다`, () =>
-            callText(SYSTEM, prompt, photo));
-          if (!data) return;
-          const raw = pickEditedItem(data);
-          if (!raw) { setState({ errorMsg: "수정된 항목을 받지 못했습니다. 다시 시도해 주세요." }); return; }
+        /* 선택한 항목 하나만 다시 분석하고, 통합 이미지는 해당 칸만 편집합니다.
+           다른 항목과 다음 단계 결과는 그대로 둡니다. */
+        async editOne(key, idx, ins) {
+          const cfg = EDIT[key];
+          const old = cfg.list().find(x => x.index === idx);
+          if (!old || !state.object) { setState({ errorMsg: "수정할 항목을 찾지 못했습니다." }); return false; }
+          const projectId = state.projectId;
 
-          const i = target.index - 1;
-          let fresh;
-          if (stage === "property") fresh = normProperty(raw, i, state.traits);
-          else if (stage === "perception") fresh = normPerception(raw, i, state.properties);
-          else fresh = normLayer(raw, i, state.perceptions);
-          /* id와 번호를 그대로 유지해야 다음 단계의 근거 연결이 끊기지 않습니다. */
-          fresh.id = target.id;
-          fresh.index = target.index;
+          const data = await withLoading(`${pad2(idx)}번 ${cfg.label} 항목만 다시 분석하고 있습니다`, () =>
+            callText(SYSTEM, cfg.prompt(idx, ins), cfg.photo ? state.images.source : null));
+          if (!data || state.projectId !== projectId) return false;
 
-          const replaced = items.map(it => (it.id === target.id ? fresh : it));
-          if (stage === "property") state.properties = replaced;
-          else if (stage === "perception") state.perceptions = replaced;
-          else state.emotion = Object.assign({}, state.emotion, { layers: replaced });
-          drafts[insId] = "";
-          persist(false);
+          const raw = pickItem(data, cfg.plural, cfg.singular);
+          if (!raw || typeof raw !== "object" || !(raw.titleKo || raw.nameKo)) {
+            setState({ errorMsg: "수정된 항목을 받지 못했습니다. 다시 시도해 주세요." });
+            return false;
+          }
+          const item = cfg.norm(raw);
+          if (!item) { setState({ errorMsg: "수정된 항목을 해석하지 못했습니다. 다시 시도해 주세요." }); return false; }
+          /* 번호와 id를 그대로 두어야 다음 단계의 '근거' 연결이 끊기지 않습니다. */
+          item.index = idx;
+          item.id = old.id || item.id;
+          if (key !== "property" && !raw.style && old.style) item.style = old.style;
+          cfg.replace(idx, item);
           render();
+          persist(false);
 
-          if (isLegacyBoard(stage)) {
-            toast("이전 버전에서 만든 보드라 이미지는 그대로 두었습니다.");
-            return;
+          await Actions.editBoardCell(key, idx);
+          toast(`${pad2(idx)}번 ${cfg.label} 항목만 수정했습니다. 다른 항목은 그대로 유지됩니다.`);
+          return true;
+        },
+
+        async editBoardCell(key, idx) {
+          const slot = key;
+          const existing = state.images[slot];
+          const projectId = state.projectId;
+          /* 아직 통합 이미지가 없으면 새로 한 장을 만듭니다. */
+          if (!existing) {
+            const made = await withLoading("통합 이미지를 만들고 있습니다", () => callImage(IMG.board(key)));
+            if (!made || state.projectId !== projectId) return false;
+            await Actions.saveImage(slot, made);
+            render();
+            return true;
           }
-          await removeItemImage(stage, target.id);
-          await Actions.buildStageImages(stage, [target.id]);
-          toast(`${pad2(target.index)}번 항목만 수정했습니다. 다른 항목은 그대로입니다.`);
+          let usedFallback = false;
+          const url = await withLoading(`통합 이미지에서 ${pad2(idx)}번 칸만 고치고 있습니다`, async () => {
+            try {
+              return await callImageEdit(IMG.edit(key, idx), existing);
+            } catch (err) {
+              if (err && (err.aborted || err.fatal)) throw err;
+              console.warn("부분 편집에 실패해 통합 이미지를 다시 만듭니다.", err);
+              usedFallback = true;
+              state.loadingMsg = "부분 편집이 지원되지 않아 통합 이미지를 다시 만들고 있습니다";
+              render();
+              return await callImage(IMG.board(key));
+            }
+          });
+          if (!url || state.projectId !== projectId) return false;
+          await Actions.saveImage(slot, url);
+          render();
+          if (usedFallback) toast("부분 편집이 지원되지 않아 통합 이미지 전체를 다시 만들었습니다.");
+          return true;
         }
       };
       window.Actions = Actions;
 
       /* =========================================================
-         15. 화면별 렌더
+         16. 화면별 렌더
          ========================================================= */
       function viewAuth() {
         return `<div class="min-h-screen flex flex-col items-center justify-center px-7 py-16 bg-white text-center animate-fade-in">
@@ -2311,7 +2246,9 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
             <div>
               <h2 class="t-label text-slate-300 mb-3">저장된 프로젝트 ${projects.length}/${CONFIG.MAX_PROJECTS}</h2>
-              ${projects.length ? `<ul class="space-y-2">${projects.map(p => {
+              ${!Store.ready
+                ? `<p class="t-small text-slate-200 bg-white/5 border border-white/20 rounded-2xl px-4 py-5">저장된 프로젝트를 불러오고 있습니다.</p>`
+                : projects.length ? `<ul class="space-y-2">${projects.map(p => {
                 const st = STAGES.find(s => s.n === (p.data && p.data.step)) || STAGES[0];
                 return `<li class="flex items-center gap-2 bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
                   <button type="button" onclick="Actions.openProject('${escAttr(p.id)}')" class="flex-1 text-left min-w-0">
@@ -2322,9 +2259,8 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
                 </li>`;
               }).join("")}</ul>`
               : `<p class="t-small text-slate-200 bg-white/5 border border-white/20 rounded-2xl px-4 py-5">아직 저장된 프로젝트가 없습니다. 사진을 올리거나 사물을 입력하면 진행 상태가 자동으로 저장됩니다.</p>`}
-              <p class="t-meta text-slate-300 mt-3 prose-ko">저장 공간이 부족하면 가장 오래된 프로젝트부터 자동으로 정리됩니다.</p>
+              <p class="t-meta text-slate-300 mt-3 prose-ko">최대 ${CONFIG.MAX_PROJECTS}개까지 보관하며, 공간이 부족하면 가장 오래된 프로젝트부터 자동으로 정리합니다.</p>
             </div>
-
           </div>
         </div>`;
       }
@@ -2345,6 +2281,8 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       function viewInput() {
         const kw = drafts["keyword-input"] !== undefined ? drafts["keyword-input"] : state.keyword;
         const photo = state.images.source;
+        const hasTraits = state.traits.length > 0;
+        const hasProps = state.properties.length > 0;
 
         const photoBlock = photo
           ? `<section class="bg-white rounded-[2rem] p-4 border-2 border-slate-200 shadow-md mb-6">
@@ -2367,6 +2305,23 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
                </div>
              </section>`;
 
+        /* 결과가 있으면 보기/이어 하기, 그리고 새 입력으로 처음부터 다시 분석을 함께 제공합니다.
+           (예전에는 물성 분석이 실패하면 '보기' 버튼이 빈 화면으로만 이어져 진행이 막혔습니다.) */
+        let dockInner;
+        if (hasProps) {
+          dockInner = `<div class="space-y-2.5">
+            ${primaryBtn("물성 분석 보기", "setState({step:2}, true)")}
+            ${secondaryBtn("이 입력으로 처음부터 다시 분석", "Actions.restartAnalysis()", "rotate-ccw")}
+          </div>`;
+        } else if (hasTraits) {
+          dockInner = `<div class="space-y-2.5">
+            ${primaryBtn("물성 분석 이어서 하기", "Actions.generateProperties()")}
+            ${secondaryBtn("이 입력으로 처음부터 다시 분석", "Actions.restartAnalysis()", "rotate-ccw")}
+          </div>`;
+        } else {
+          dockInner = primaryBtn(photo ? "사진으로 물성 분석" : "물성 분석 시작", "Actions.generateObject()");
+        }
+
         return `<div class="page-top px-4 dock-space animate-fade-in">
           ${header("사물 입력", 0)}
           ${sectionTitle("어떤 사물을 읽어 볼까요?", "사진을 찍거나 올리면 그 개체를 기준으로, 사진이 없으면 가장 전형적인 표본을 기준으로 분석합니다.")}
@@ -2378,7 +2333,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             class="w-full p-5 bg-white border-2 border-slate-300 rounded-2xl focus:border-teal-700 outline-none t-h3 text-slate-900 placeholder:text-slate-400 placeholder:font-normal mb-3"
             placeholder="${photo ? "비워 두면 사진에서 판별합니다" : "예: 나뭇잎"}" />
 
-          <section class="bg-white rounded-[2rem] p-5 border-2 border-slate-200 shadow-md">
+          <section class="bg-white rounded-[2rem] p-5 border-2 border-slate-200 shadow-md ${hasTraits ? "mb-24" : ""}">
             <h3 class="t-label text-slate-500 mb-3">진행 순서</h3>
             <ol class="space-y-2.5">
               ${STAGES.map(s => `<li class="flex items-center gap-3">
@@ -2389,7 +2344,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             <p class="t-meta text-slate-500 mt-4 prose-ko">사물의 물성에서 출발해 지각과 경험의 감성으로 이어지는 분석입니다.</p>
           </section>
 
-          ${nextDock(2, photo ? "사진으로 물성 분석" : "물성 분석 시작")}
+          ${dock(dockInner)}
         </div>`;
       }
 
@@ -2407,11 +2362,13 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       }
 
       function viewProperty() {
+        const tgt = currentTarget("property", state.properties);
         const cards = state.properties.map(p => infoCard({
           index: p.index,
           title: p.titleKo,
           subtitle: p.titleEn,
           badge: p.axis,
+          active: tgt === p.index,
           body: `
             <p class="t-small text-slate-700 prose-ko">${esc(p.description)}</p>
             ${p.measure ? `<p class="t-meta text-slate-500 prose-ko">측정·확인 · ${esc(p.measure)}</p>` : ""}
@@ -2427,30 +2384,37 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           ${imageCard("property", {
             title: "물성 통합 이미지",
             alt: "물성별 대표 표면·광학·촉감 이미지 보드",
+            caption: "각 물성을 대표하는 이미지를 한 장의 에디토리얼 보드로 묶었습니다.",
             empty: "물성 통합 이미지를 아직 만들지 않았습니다.",
-            onGenerate: "Actions.buildMissing('property')"
+            onGenerate: "Actions.generatePropertyImage()"
           })}
 
           <div class="space-y-3">${cards}</div>
-          ${instructionBox("property", "예: 시간이 지나며 변하는 물성을 더 분명하게 다뤄 주세요")}
+          ${instructionBox("property", state.properties, {
+            titleKey: "titleKo",
+            placeholder: "예: 시간이 지나며 변하는 물성을 더 분명하게 다뤄 주세요",
+            downstreamNote: state.perceptions.length ? "전체를 다시 생성하면 지각·감성 분석 결과가 지워집니다." : ""
+          })}
 
-          ${nextDock(3, "지각 분석")}
+          ${nextDock(3, "지각 분석", "Actions.generatePerceptions()")}
         </div>`;
       }
 
-      /* ---- 4단계 : 지각 분석 ---- */
+      /* ---- 3단계 : 지각 분석 ---- */
       function viewPerception() {
-        const items = state.perceptions.map(p => infoCard({
-              index: p.index,
-              title: p.titleKo,
-              subtitle: p.titleEn,
-              badge: p.moment,
-              body: `
-                ${p.situation ? `<p class="t-meta font-bold text-teal-800 prose-ko">${esc(p.situation)}</p>` : ""}
-                <p class="t-small text-slate-700 prose-ko">${esc(p.description)}</p>
-                ${p.cue ? `<p class="t-meta text-slate-500 prose-ko">관찰 단서 · ${esc(p.cue)}</p>` : ""}
-                ${sourceLine("근거 물성", p.fromIds, state.properties, "titleKo")}`
-            })).join("");
+        const tgt = currentTarget("perception", state.perceptions);
+        const cards = state.perceptions.map(p => infoCard({
+          index: p.index,
+          title: p.titleKo,
+          subtitle: p.titleEn,
+          badge: p.moment,
+          active: tgt === p.index,
+          body: `
+            ${p.situation ? `<p class="t-meta font-bold text-teal-800 prose-ko">${esc(p.situation)}</p>` : ""}
+            <p class="t-small text-slate-700 prose-ko">${esc(p.description)}</p>
+            ${p.cue ? `<p class="t-meta text-slate-500 prose-ko">관찰 단서 · ${esc(p.cue)}</p>` : ""}
+            ${sourceLine("근거 물성", p.fromIds, state.properties, "titleKo")}`
+        })).join("");
 
         return `<div class="page-top px-4 dock-space animate-fade-in">
           ${header("지각 분석", 2)}
@@ -2459,25 +2423,32 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           ${imageCard("perception", {
             title: "지각 분석 통합 이미지",
             alt: "지각 특성을 영감 관점으로 표현한 디자인 매거진 스타일 이미지",
+            caption: "분석한 대상을 직접 반복하지 않고, 지각 특성을 가장 잘 드러내는 건축·패션·자연·조명·가구·일러스트 등 영감의 관점으로 시각화했습니다.",
             empty: "지각 분석 영감 이미지를 아직 만들지 않았습니다.",
-            onGenerate: "Actions.buildMissing('perception')"
+            onGenerate: "Actions.generatePerceptionImage()"
           })}
 
-          <div class="space-y-3">${items}</div>
-          ${instructionBox("perception", "예: 접촉과 반응 순간의 지각을 손의 감각 중심으로 더 구체적으로 써 주세요")}
+          <div class="space-y-3">${cards}</div>
+          ${instructionBox("perception", state.perceptions, {
+            titleKey: "titleKo",
+            placeholder: "예: 자연 이미지 반복을 줄이고 접촉 반응·공간 깊이·시간적 회복이 더 분명하도록 다시 구성해 주세요",
+            downstreamNote: state.emotion ? "전체를 다시 생성하면 감성 분석 결과가 지워집니다." : ""
+          })}
 
-          ${nextDock(4, "감성 분석")}
+          ${nextDock(4, "감성 분석", "Actions.generateEmotion()")}
         </div>`;
       }
 
-      /* ---- 5단계 : 감성 분석 ---- */
+      /* ---- 4단계 : 감성 분석 ---- */
       function viewEmotion() {
         const e = state.emotion;
+        const tgt = currentTarget("emotion", e.layers);
         const layers = e.layers.map(l => infoCard({
           index: l.index,
           title: l.nameKo,
           subtitle: l.nameEn,
           badge: `강도 ${l.intensity}`,
+          active: tgt === l.index,
           body: `
             <p class="t-small text-slate-700 prose-ko">${esc(l.description)}</p>
             <p class="t-meta text-slate-500">감성 강도 · ${esc(l.intensity)}/100</p>
@@ -2500,19 +2471,20 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           ${imageCard("emotion", {
             title: "대표 감성 키워드 이미지",
             alt: "사물 경험에서 도출된 주요 감성들의 무드 이미지",
+            caption: "사용자가 최종적으로 갖게 되는 대표 경험 감성 2개를 전문적인 디자인 잡지 이미지처럼 세련되게 시각화했습니다.",
             empty: "대표 감성 키워드 이미지를 아직 만들지 않았습니다.",
-            onGenerate: "Actions.buildMissing('emotion')"
+            onGenerate: "Actions.generateEmotionImage()"
           })}
 
-          <h3 class="t-h3 text-slate-900 mb-3 px-1">대표 감성 키워드 2개</h3>
+          <h3 class="t-h3 text-slate-900 mb-3 px-1">대표 감성 키워드 ${e.layers.length}개</h3>
           <div class="space-y-3">${layers}</div>
-          ${instructionBox("emotion", "예: 서로 상반된 지각이 만드는 긴장감을 감성 정의에 더 반영해 주세요")}
+          ${instructionBox("emotion", e.layers, {
+            titleKey: "nameKo",
+            placeholder: "예: 서로 상반된 지각이 만드는 긴장감을 감성 정의에 더 반영해 주세요",
+            downstreamNote: ""
+          })}
 
-          ${dock(`
-            <div class="space-y-2.5">
-              ${primaryBtn("전체 리포트 PDF로 저장", "Actions.exportPdf()")}
-            </div>
-          `)}
+          ${dock(primaryBtn("전체 리포트 PDF로 저장", "Actions.exportPdf()"))}
         </div>`;
       }
 
@@ -2522,8 +2494,8 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         if (state.isAnalyzing) {
           html += `<div class="fixed inset-0 z-[10000] bg-white/95 backdrop-blur-sm flex flex-col items-center justify-center px-8 text-center max-w-[430px] mx-auto animate-fade-in" role="status" aria-live="polite">
             <div class="spinner-ring mb-8" role="presentation"></div>
-            <h2 class="t-h2 text-slate-900 mb-2 prose-ko">${esc(state.loadingMsg)}</h2>
-            <p class="t-small text-slate-600 mb-8">1분 넘게 걸릴 수 있습니다</p>
+            <h2 class="t-h2 text-slate-900 mb-2 w-full prose-center">${esc(state.loadingMsg)}</h2>
+            <p class="t-small text-slate-600 mb-8 w-full prose-center">1분 넘게 걸릴 수 있습니다</p>
             <button type="button" onclick="Actions.cancel()" class="px-7 py-3.5 rounded-2xl border-2 border-slate-300 text-slate-700 font-bold t-small hover:bg-slate-50 active:scale-95 transition-all">취소</button>
           </div>`;
         }
@@ -2544,7 +2516,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           html += `<div class="fixed inset-0 z-[10002] flex items-center justify-center bg-black/50 px-6 backdrop-blur-sm" role="alertdialog" aria-modal="true" aria-labelledby="err-title">
             <div class="bg-white p-8 rounded-3xl w-full max-w-sm text-center shadow-2xl animate-scale-in">
               <i data-lucide="alert-triangle" class="text-red-600 mx-auto mb-4 w-12 h-12"></i>
-              <h2 id="err-title" class="t-h3 text-slate-900 mb-6 prose-ko">${esc(state.errorMsg)}</h2>
+              <h2 id="err-title" class="t-h3 text-slate-900 mb-6 prose-center">${esc(state.errorMsg)}</h2>
               <button type="button" onclick="setState({errorMsg:null})" class="w-full bg-slate-900 text-white py-4 rounded-2xl font-bold t-small">확인</button>
             </div>
           </div>`;
@@ -2590,7 +2562,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           case 1:  return viewInput();
           case 2:  return state.properties.length ? viewProperty() : fallback(1, "분석된 물성이 없습니다.");
           case 3:  return state.perceptions.length ? viewPerception() : fallback(2, "분석된 지각이 없습니다.");
-          case 4:  return state.emotion ? viewEmotion() : fallback(3, "분석된 감성이 없습니다.");
+          case 4:  return state.emotion && state.emotion.layers.length ? viewEmotion() : fallback(3, "분석된 감성이 없습니다.");
           default: return fallback(0, "요청한 화면을 찾을 수 없습니다.");
         }
       }
@@ -2627,17 +2599,16 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         else if (state.isAnalyzing) Actions.cancel();
       });
 
-      setInterval(() => { try { persist(false); } catch (e) { console.warn("자동 저장 실패", e); } }, CONFIG.AUTOSAVE_MS);
-      window.addEventListener("beforeunload", () => { try { persist(false); } catch (e) { /* 무시 */ } });
-      /* 휴대폰은 앱 전환 때 페이지가 그대로 종료될 수 있어 화면이 가려질 때 바로 저장합니다. */
-      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { try { persist(false); } catch (e) { /* 무시 */ } } });
-      window.addEventListener("pagehide", () => { try { persist(false); } catch (e) { /* 무시 */ } });
-      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* 무시 */ }
+      setInterval(() => { persist(false); }, CONFIG.AUTOSAVE_MS);
+      window.addEventListener("beforeunload", () => { persist(false); });
 
       loadSession();
       if (state.apiKey) state.step = 0;
       render(true);
-      Store.migrateFromIdb().then(moved => { if (moved && state.step === 0) render(); });
+
+      Store.init()
+        .catch(e => { console.warn("저장소 초기화 실패", e); Store.ready = true; })
+        .then(() => { if (state.step === 0) render(); });
     })();
   </script>
 </body>
