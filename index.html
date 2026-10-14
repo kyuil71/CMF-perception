@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>사물 · 물성 · 지각 · 감성 랩 v6</title>
+  <title>사물 · 물성 · 지각 · 감성 랩 v8</title>
 
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
@@ -476,28 +476,18 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           im.src = src;
         });
       }
-      function canvasBlob(cv, quality) {
-        return new Promise(res => {
-          try { cv.toBlob(b => res(b && b.size ? b : null), "image/jpeg", quality || 0.9); }
-          catch (e) { res(null); }
-        });
-      }
-      /* 생성된 PNG를 JPEG Blob으로 줄여 저장 용량을 낮춥니다. */
-      async function toJpegBlob(src, quality) {
+      /* 생성된 PNG를 JPEG data URL로 줄여 저장 용량을 낮춥니다. */
+      async function toJpeg(src, quality) {
         const im = await loadImg(src);
-        if (im && im.naturalWidth) {
-          try {
-            const cv = document.createElement("canvas");
-            cv.width = im.naturalWidth; cv.height = im.naturalHeight;
-            const ctx = cv.getContext("2d");
-            ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, cv.width, cv.height);
-            ctx.drawImage(im, 0, 0);
-            const b = await canvasBlob(cv, quality || 0.88);
-            if (b) return b;
-          } catch (e) { /* 아래 방식으로 대체 */ }
-        }
-        try { const r = await fetch(src); const b = await r.blob(); return b && b.size ? b : null; }
-        catch (e) { return null; }
+        if (!im || !im.naturalWidth) return src;
+        try {
+          const cv = document.createElement("canvas");
+          cv.width = im.naturalWidth; cv.height = im.naturalHeight;
+          const ctx = cv.getContext("2d");
+          ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, cv.width, cv.height);
+          ctx.drawImage(im, 0, 0);
+          return cv.toDataURL("image/jpeg", quality || 0.88);
+        } catch (e) { return src; }
       }
       async function ensureFonts() {
         try {
@@ -616,7 +606,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           }
           y += rowH[r] + G;
         }
-        return canvasBlob(cv, 0.9);
+        return cv.toDataURL("image/jpeg", 0.9);
       }
 
       /* =========================================================
@@ -660,19 +650,13 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       const BOARD_SLOTS = ["source", "property", "perception", "emotion"];
       const blankImages = () => ({ source: null, property: null, perception: null, emotion: null });
       const blankItemImages = () => ({ property: {}, perception: {}, emotion: {} });
-      const OWN_KEY_PREFIX = "cmf_reverse_";
-
-      function isQuotaError(e) {
-        if (!e) return false;
-        const name = String(e.name || "");
-        return /quota/i.test(name) || e.code === 22 || e.code === 1014 || /quota|exceed/i.test(String(e.message || ""));
-      }
 
       /* ---------------------------------------------------------
-         IndexedDB 한 곳에 프로젝트 글(projects)과 이미지(images)를 함께 둡니다.
-         예전에는 글은 localStorage, 이미지는 IndexedDB로 나뉘어 있어서
-         localStorage 저장이 실패하면 글과 이미지가 서로 어긋났고,
-         다시 열었을 때 이미지가 비는 문제가 생겼습니다.
+         저장 방식 — '감성 · 지각 · 인터랙션 컨셉 랩 v12.10'과 같은 방식입니다.
+         · 프로젝트 글(분석 내용)은 localStorage에 목록으로 저장합니다. (최대 5개)
+         · 이미지는 IndexedDB 'images' 저장소에 data URL 문자열로 저장합니다.
+           키는 `프로젝트id::슬롯` 입니다. (보드: property / perception / emotion / source,
+           항목별 이미지: item::단계::항목id)
          --------------------------------------------------------- */
       let imageDbPromise = null;
       const ImageDB = {
@@ -680,65 +664,60 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           if (!("indexedDB" in window) || !window.indexedDB) return Promise.reject(new Error("IDB_UNAVAILABLE"));
           if (imageDbPromise) return imageDbPromise;
           imageDbPromise = new Promise((res, rej) => {
+            /* v5~v7이 이 DB를 버전 2로 올려 두었기 때문에 같은 버전으로 엽니다. */
             const req = indexedDB.open(CONFIG.IMAGE_DB.name, 2);
             req.onupgradeneeded = () => {
               const db = req.result;
-              if (!db.objectStoreNames.contains(CONFIG.IMAGE_DB.store)) db.createObjectStore(CONFIG.IMAGE_DB.store, { keyPath: "id" });
-              if (!db.objectStoreNames.contains("projects")) db.createObjectStore("projects", { keyPath: "id" });
+              if (!db.objectStoreNames.contains(CONFIG.IMAGE_DB.store)) {
+                db.createObjectStore(CONFIG.IMAGE_DB.store, { keyPath: "id" });
+              }
             };
             req.onsuccess = () => {
               const db = req.result;
-              /* 다른 탭에서 버전을 올리면 연결을 닫고 다음 요청 때 다시 엽니다. */
               db.onversionchange = () => { try { db.close(); } catch (e) { /* 무시 */ } imageDbPromise = null; };
               res(db);
             };
             req.onerror = () => rej(req.error || new Error("IDB_OPEN_FAILED"));
-            req.onblocked = () => rej(new Error("IDB_BLOCKED"));
           });
           imageDbPromise.catch(() => { imageDbPromise = null; });
           return imageDbPromise;
         },
-        /* 쓰기는 트랜잭션이 실제로 끝났을 때(oncomplete) 성공으로 봅니다.
-           저장 공간 초과는 요청 성공 뒤 커밋 단계에서 abort로 오기 때문입니다. */
         _act(mode, fn, storeName) {
           const name = storeName || CONFIG.IMAGE_DB.store;
           return ImageDB.open().then(db => new Promise((res, rej) => {
-            let tx;
-            try { tx = db.transaction(name, mode); }
-            catch (e) { imageDbPromise = null; rej(e); return; }
-            let result;
+            const tx = db.transaction(name, mode);
             const rq = fn(tx.objectStore(name));
-            if (rq) rq.onsuccess = () => { result = rq.result; };
-            tx.oncomplete = () => res(result);
-            tx.onerror = () => rej(tx.error || (rq && rq.error) || new Error("IDB_REQUEST_FAILED"));
-            tx.onabort = () => rej(tx.error || new Error("IDB_ABORTED"));
+            rq.onsuccess = () => res(rq.result);
+            rq.onerror = () => rej(rq.error || new Error("IDB_REQUEST_FAILED"));
           }));
         },
         key: (projectId, slot) => `${projectId}::${slot}`,
         range: prefix => IDBKeyRange.bound(prefix, prefix + " "),
-        /* value는 Blob(생성 이미지) 또는 data URL 문자열(사진)입니다. */
-        async put(projectId, slot, value) {
+        async put(projectId, slot, dataUrl) {
           try {
-            const row = { id: ImageDB.key(projectId, slot), projectId, slot, savedAt: Date.now() };
-            if (typeof value === "string") row.dataUrl = value; else row.blob = value;
-            await ImageDB._act("readwrite", st => st.put(row));
-            return { ok: true };
-          } catch (e) {
-            console.warn("이미지 저장 실패", e);
-            return { ok: false, quota: isQuotaError(e) };
-          }
+            await ImageDB._act("readwrite", st => st.put({
+              id: ImageDB.key(projectId, slot), projectId, slot, dataUrl, savedAt: Date.now()
+            }));
+            return true;
+          } catch (e) { console.warn("이미지 저장 실패", slot, e); return false; }
         },
-        /* 프로젝트의 보드 이미지와 항목별 이미지를 한 번에 읽어 화면용 주소로 바꿉니다. */
-        async loadProject(projectId) {
+        async get(projectId, slot) {
+          try {
+            const row = await ImageDB._act("readonly", st => st.get(ImageDB.key(projectId, slot)));
+            return row ? await rowDataUrl(row) : null;
+          } catch (e) { return null; }
+        },
+        /* 프로젝트의 보드 이미지와 항목별 이미지를 모두 읽어 옵니다. */
+        async loadAll(projectId) {
           const images = blankImages();
           const itemImages = blankItemImages();
           let failed = false;
           try {
             const prefix = `${projectId}::`;
             const rows = await ImageDB._act("readonly", st => st.getAll(ImageDB.range(prefix)));
-            (rows || []).forEach(row => {
-              const url = rowUrl(row);
-              if (!url) return;
+            for (const row of (rows || [])) {
+              const url = await rowDataUrl(row);
+              if (!url) continue;
               const slot = String(row.id).slice(prefix.length);
               if (slot.indexOf("item::") === 0) {
                 const parts = slot.split("::");
@@ -746,136 +725,111 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
               } else if (BOARD_SLOTS.includes(slot)) {
                 images[slot] = url;
               }
-            });
+            }
           } catch (e) {
             console.warn("이미지를 불러오지 못했습니다.", e);
             failed = true;
           }
           return { images, itemImages, failed };
         },
-        remove(projectId, slot) {
-          return ImageDB._act("readwrite", st => st.delete(ImageDB.key(projectId, slot))).catch(() => {});
+        async remove(projectId, slot) {
+          try { await ImageDB._act("readwrite", st => st.delete(ImageDB.key(projectId, slot))); return true; }
+          catch (e) { console.warn("이미지 삭제 실패", slot, e); return false; }
         },
-        removePrefix(prefix) {
-          return ImageDB._act("readwrite", st => st.delete(ImageDB.range(prefix))).catch(() => {});
+        async removePrefix(prefix) {
+          try { await ImageDB._act("readwrite", st => st.delete(ImageDB.range(prefix))); return true; }
+          catch (e) { return false; }
         },
         removeProject(projectId) {
           return ImageDB.removePrefix(`${projectId}::`);
         }
       };
 
-      /* 화면에는 Blob을 가리키는 짧은 주소(blob:)를 씁니다.
-         수 MB짜리 base64 문자열을 화면에 매번 다시 그리지 않아 휴대폰에서도 가볍습니다. */
-      const liveUrls = new Set();
-      function rowUrl(row) {
+      /* v5~v7은 이미지를 Blob/바이트 배열로 저장했습니다. 읽을 때 data URL로 바꾸고 그 형식으로 다시 저장합니다. */
+      function readAsDataUrl(blob) {
+        return new Promise((res, rej) => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result);
+          fr.onerror = () => rej(fr.error || new Error("READ_FAILED"));
+          fr.readAsDataURL(blob);
+        });
+      }
+      async function rowDataUrl(row) {
         if (!row) return null;
-        if (row.blob instanceof Blob && row.blob.size) {
-          const u = URL.createObjectURL(row.blob);
-          liveUrls.add(u);
-          return u;
+        if (typeof row.dataUrl === "string" && row.dataUrl.indexOf("data:") === 0) return row.dataUrl;
+        let blob = null;
+        if (row.buf && row.buf.byteLength) blob = new Blob([row.buf], { type: row.type || "image/jpeg" });
+        else if (row.blob && row.blob.size) blob = row.blob;
+        if (!blob) return null;
+        try {
+          const dataUrl = await readAsDataUrl(blob);
+          if (typeof dataUrl !== "string" || dataUrl.indexOf("data:") !== 0) return null;
+          ImageDB._act("readwrite", st => st.put({
+            id: row.id, projectId: row.projectId, slot: row.slot, dataUrl, savedAt: row.savedAt || Date.now()
+          })).catch(() => {});
+          return dataUrl;
+        } catch (e) {
+          console.warn("이전 형식 이미지를 읽지 못했습니다.", row.id, e);
+          return null;
         }
-        return typeof row.dataUrl === "string" && row.dataUrl.indexOf("data:") === 0 ? row.dataUrl : null;
-      }
-      function blobUrl(blob) {
-        const u = URL.createObjectURL(blob);
-        liveUrls.add(u);
-        return u;
-      }
-      /* 화면에서 사라진 뒤에 지우도록 조금 늦게 해제합니다. */
-      function releaseUrl(u) {
-        if (!u || u.indexOf("blob:") !== 0 || !liveUrls.has(u)) return;
-        liveUrls.delete(u);
-        setTimeout(() => { try { URL.revokeObjectURL(u); } catch (e) { /* 무시 */ } }, 4000);
-      }
-      function releaseAllUrls() {
-        Array.from(liveUrls).forEach(releaseUrl);
       }
 
       const Store = {
-        cache: [],
-        _tx(mode, fn) { return ImageDB._act(mode, fn, "projects"); },
-        list() { return Store.cache; },
-        async refresh() {
-          try {
-            const rows = await Store._tx("readonly", st => st.getAll());
-            Store.cache = (rows || [])
-              .filter(r => r && r.id && r.data)
-              .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
-              .map(r => ({ id: r.id, title: r.title || "이름 없는 프로젝트", savedAt: r.savedAt || 0, step: r.data.step || 1 }));
-          } catch (e) {
-            console.warn("프로젝트 목록을 읽지 못했습니다.", e);
-          }
-          return Store.cache;
-        },
-        async get(id) {
-          try { return await Store._tx("readonly", st => st.get(id)); }
-          catch (e) { console.warn(e); return null; }
-        },
-        /* 저장 후 개수 제한(MAX_PROJECTS)을 넘으면 가장 오래된 프로젝트를 이미지까지 지웁니다.
-           저장 공간이 부족하면 현재 프로젝트를 뺀 가장 오래된 것부터 지우고 다시 시도합니다. */
-        async save(snap, meta) {
-          const row = { id: meta.id, title: meta.title, savedAt: Date.now(), data: snap };
-          const evicted = [];
-          for (let tries = 0; tries <= CONFIG.MAX_PROJECTS; tries++) {
-            try {
-              await Store._tx("readwrite", st => st.put(row));
-              await Store.refresh();
-              while (Store.cache.length > CONFIG.MAX_PROJECTS) {
-                const old = Store.cache[Store.cache.length - 1];
-                if (old.id === meta.id) break;
-                await Store.remove(old.id);
-              }
-              return { ok: true, evicted };
-            } catch (e) {
-              if (!isQuotaError(e)) { console.warn("프로젝트 저장 실패", e); return { ok: false, quota: false, evicted }; }
-              const gone = await Store.evictOldest(meta.id);
-              if (!gone) return { ok: false, quota: true, evicted };
-              evicted.push(gone);
-            }
-          }
-          return { ok: false, quota: true, evicted };
-        },
-        async remove(id) {
-          await ImageDB.removeProject(id);
-          try { await Store._tx("readwrite", st => st.delete(id)); } catch (e) { console.warn(e); }
-          Store.cache = Store.cache.filter(p => p.id !== id);
-        },
-        /* 현재 프로젝트를 제외한 가장 오래된 프로젝트 하나를 지웁니다. */
-        async evictOldest(exceptId) {
-          await Store.refresh();
-          for (let i = Store.cache.length - 1; i >= 0; i--) {
-            const p = Store.cache[i];
-            if (p.id !== exceptId) { await Store.remove(p.id); return p; }
-          }
-          return null;
-        },
-        /* 이전 버전이 localStorage에 둔 프로젝트를 IndexedDB로 옮기고 localStorage를 비웁니다.
-           같은 사이트(github.io)의 다른 도구와 함께 쓰는 localStorage 공간도 함께 확보됩니다. */
-        async migrate() {
+        list() {
           try {
             const raw = localStorage.getItem(CONFIG.PROJECTS_KEY);
-            if (raw) {
-              let list = [];
-              try { list = JSON.parse(raw); } catch (e) { list = []; }
-              if (Array.isArray(list)) {
-                for (const p of list) {
-                  if (!p || !p.id || !p.data) continue;
-                  const exists = await Store.get(p.id);
-                  if (!exists) await Store._tx("readwrite", st => st.put({ id: p.id, title: p.title, savedAt: p.savedAt || Date.now(), data: p.data }));
-                }
-              }
-              localStorage.removeItem(CONFIG.PROJECTS_KEY);
-            }
-            const legacy = [];
-            for (let i = 0; i < localStorage.length; i++) {
-              const k = localStorage.key(i);
-              if (k && k.indexOf(OWN_KEY_PREFIX) === 0) legacy.push(k);
-            }
-            legacy.forEach(k => localStorage.removeItem(k));
+            const list = raw ? JSON.parse(raw) : [];
+            return Array.isArray(list) ? list : [];
           } catch (e) {
-            console.warn("이전 프로젝트를 옮기지 못했습니다.", e);
+            console.warn("저장 목록을 읽지 못했습니다.", e);
+            return [];
           }
-          await Store.refresh();
+        },
+        _write(list) {
+          try { localStorage.setItem(CONFIG.PROJECTS_KEY, JSON.stringify(list)); return true; }
+          catch (e) { return false; }
+        },
+        save(snap, meta) {
+          let list = Store.list().filter(p => p.id !== meta.id);
+          list.unshift({ id: meta.id, title: meta.title, savedAt: Date.now(), data: snap });
+          if (list.length > CONFIG.MAX_PROJECTS) {
+            list.slice(CONFIG.MAX_PROJECTS).forEach(p => ImageDB.removeProject(p.id));
+            list = list.slice(0, CONFIG.MAX_PROJECTS);
+          }
+          if (Store._write(list)) return { ok: true };
+          /* 공간이 부족하면 가장 오래된 프로젝트부터 하나씩 지우며 다시 저장합니다. */
+          let reduced = list.slice();
+          while (reduced.length > 1) {
+            reduced = reduced.slice(0, reduced.length - 1);
+            if (Store._write(reduced)) {
+              list.slice(reduced.length).forEach(p => ImageDB.removeProject(p.id));
+              return { ok: true, pruned: list.length - reduced.length };
+            }
+          }
+          return { ok: false };
+        },
+        remove(id) {
+          ImageDB.removeProject(id);
+          return Store._write(Store.list().filter(p => p.id !== id));
+        },
+        /* v5~v7이 IndexedDB 'projects' 저장소에 둔 프로젝트를 localStorage 목록으로 되돌립니다. */
+        async migrateFromIdb() {
+          try {
+            const db = await ImageDB.open();
+            if (!db.objectStoreNames.contains("projects")) return false;
+            const rows = await ImageDB._act("readonly", st => st.getAll(), "projects");
+            if (!rows || !rows.length) return false;
+            const have = new Set(Store.list().map(p => p.id));
+            const add = rows.filter(r => r && r.id && r.data && !have.has(r.id))
+              .map(r => ({ id: r.id, title: r.title || "이름 없는 프로젝트", savedAt: r.savedAt || Date.now(), data: r.data }));
+            if (!add.length) { await ImageDB._act("readwrite", st => st.clear(), "projects"); return false; }
+            const list = Store.list().concat(add).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0)).slice(0, CONFIG.MAX_PROJECTS);
+            if (Store._write(list)) {
+              await ImageDB._act("readwrite", st => st.clear(), "projects");
+              return true;
+            }
+          } catch (e) { console.warn("이전 프로젝트를 옮기지 못했습니다.", e); }
+          return false;
         }
       };
 
@@ -1398,55 +1352,35 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
       let quotaWarned = false;
       let lastSavedJson = "";
-      let saveChain = Promise.resolve();
-      /* 저장은 순서대로 한 번에 하나씩 처리합니다. 바뀐 것이 없으면 다시 쓰지 않습니다. */
       function persist(showToast) {
-        if (!hasContent()) return Promise.resolve("empty");
+        if (!hasContent()) return "empty";
         const snap = snapshot();
-        const meta = { id: state.projectId, title: projectTitle() };
-        let json = "";
-        try { json = JSON.stringify(snap); } catch (e) { json = ""; }
-        if (!showToast && json && json === lastSavedJson) return Promise.resolve("ok");
-        lastSavedJson = json;
-        const job = saveChain.then(async () => {
-          const r = await Store.save(snap, meta);
-          if (r.ok) {
-            quotaWarned = false;
-            if (showToast) toast("진행 상태를 저장했습니다.");
-            if (r.evicted && r.evicted.length) toast(`저장 공간을 확보하려고 오래된 프로젝트 ${r.evicted.length}개를 정리했습니다.`);
-            if (state.step === 0) render();
-            return "ok";
-          }
-          if (lastSavedJson === json) lastSavedJson = "";
-          if (!quotaWarned || showToast) {
-            quotaWarned = true;
-            toast(r.quota
-              ? "기기 저장 공간이 부족해 이 프로젝트를 저장하지 못했습니다. 리포트를 PDF로 내려받아 두세요."
-              : "이 브라우저에서는 프로젝트를 저장할 수 없습니다. 리포트를 PDF로 내려받아 두세요.", "error");
-          }
-          return "full";
-        });
-        saveChain = job.catch(() => "full");
-        return job;
+        const sig = JSON.stringify(snap) + "|" + projectTitle();
+        if (sig === lastSavedJson && !showToast) return "ok";
+        const r = Store.save(snap, { id: state.projectId, title: projectTitle() });
+        if (r.ok) {
+          lastSavedJson = sig;
+          quotaWarned = false;
+          if (showToast) toast("진행 상태를 저장했습니다.");
+          if (r.pruned) toast("저장 공간이 부족해 가장 오래된 프로젝트를 정리했습니다.");
+          return "ok";
+        }
+        if (!quotaWarned) {
+          quotaWarned = true;
+          toast("저장 공간이 부족해 자동 저장이 중단되었습니다. 리포트를 PDF로 내려받아 주세요.", "error");
+        }
+        return "full";
       }
 
-      /* 이미지를 IndexedDB에 저장합니다. 공간이 부족하면 오래된 프로젝트부터 지우고 다시 시도합니다. */
-      let imageQuotaWarned = false;
-      async function storeImage(slot, value) {
-        const pid = state.projectId;
-        for (let tries = 0; tries <= CONFIG.MAX_PROJECTS; tries++) {
-          const r = await ImageDB.put(pid, slot, value);
-          if (r.ok) return true;
-          if (!r.quota) break;
-          const gone = await Store.evictOldest(pid);
-          if (!gone) break;
-          toast(`저장 공간을 확보하려고 오래된 프로젝트 '${gone.title}'를 정리했습니다.`);
-        }
-        if (!imageQuotaWarned) {
-          imageQuotaWarned = true;
+      /* 이미지를 IndexedDB에 data URL 문자열로 저장합니다. */
+      let imageSaveWarned = false;
+      async function storeImage(slot, dataUrl) {
+        const ok = await ImageDB.put(state.projectId, slot, dataUrl);
+        if (!ok && !imageSaveWarned) {
+          imageSaveWarned = true;
           toast("이미지를 브라우저에 저장하지 못했습니다. 화면의 이미지는 남아 있으니 필요하면 내려받아 두세요.", "error");
         }
-        return false;
+        return ok;
       }
 
       /* 다시 생성하면 해당 단계의 보드와 항목별 이미지를 화면과 저장소 양쪽에서 함께 지웁니다.
@@ -1456,8 +1390,6 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         const items = Object.assign(blankItemImages(), state.itemImages);
         const kinds = Object.assign({}, state.boardKind);
         stages.forEach(s => {
-          releaseUrl(images[s]);
-          Object.values(items[s] || {}).forEach(releaseUrl);
           images[s] = null;
           items[s] = {};
           delete kinds[s];
@@ -1469,17 +1401,15 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         state.boardKind = kinds;
       }
 
-      async function setItemImage(stage, id, blob) {
+      async function setItemImage(stage, id, dataUrl) {
         const items = Object.assign(blankItemImages(), state.itemImages);
-        releaseUrl(items[stage] && items[stage][id]);
-        items[stage] = Object.assign({}, items[stage], { [id]: blobUrl(blob) });
+        items[stage] = Object.assign({}, items[stage], { [id]: dataUrl });
         state.itemImages = items;
-        await storeImage(`item::${stage}::${id}`, blob);
+        await storeImage(`item::${stage}::${id}`, dataUrl);
       }
       async function removeItemImage(stage, id) {
         const items = Object.assign(blankItemImages(), state.itemImages);
         items[stage] = Object.assign({}, items[stage]);
-        releaseUrl(items[stage][id]);
         delete items[stage][id];
         state.itemImages = items;
         await ImageDB.remove(state.projectId, `item::${stage}::${id}`);
@@ -1495,11 +1425,10 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             const job = queue.shift();
             try {
               const raw = await callImage(itemPrompt(stage, job.item, job.i), ITEM_IMAGE_SIZE[stage]);
-              const blob = await toJpegBlob(raw, 0.88);
-              if (!blob) throw new Error("이미지를 변환하지 못했습니다.");
+              const jpg = await toJpeg(raw, 0.88);
               /* 생성 도중 다른 프로젝트로 바뀌었거나 항목이 다시 생성되었으면 버립니다. */
               if (state.projectId === pid && stageItems(stage).some(it => it.id === job.item.id)) {
-                await setItemImage(stage, job.item.id, blob);
+                await setItemImage(stage, job.item.id, jpg);
               }
             } catch (err) {
               if (err && err.aborted) { queue.length = 0; throw err; }
@@ -1516,12 +1445,11 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
       }
 
       async function rebuildBoard(stage) {
-        const blob = await composeBoard(stage);
-        if (!blob) return;
-        releaseUrl(state.images[stage]);
-        state.images = Object.assign({}, state.images, { [stage]: blobUrl(blob) });
+        const board = await composeBoard(stage);
+        if (!board) return;
+        state.images = Object.assign({}, state.images, { [stage]: board });
         state.boardKind = Object.assign({}, state.boardKind, { [stage]: "items" });
-        await storeImage(stage, blob);
+        await storeImage(stage, board);
       }
 
       /* =========================================================
@@ -2008,7 +1936,6 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
         startNewProject() {
           persist(false);
-          releaseAllUrls();
           Object.assign(state, blankProject());
           lastSavedJson = "";
           Object.keys(drafts).forEach(k => { delete drafts[k]; });
@@ -2017,10 +1944,9 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
 
         async openProject(id) {
           if (state.isAnalyzing) return;
-          await persist(false);
-          const row = await Store.get(id);
-          if (!row || !row.data) { toast("프로젝트를 찾지 못했습니다.", "error"); await Store.refresh(); render(); return; }
-          releaseAllUrls();
+          const row = Store.list().find(p => p.id === id);
+          if (!row || !row.data) { toast("프로젝트를 찾지 못했습니다.", "error"); render(); return; }
+          persist(false);
           const d = row.data;
           Object.assign(state, blankProject(), {
             projectId: d.projectId || row.id,
@@ -2043,26 +1969,43 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
           let step = Math.min(Math.max(1, d.step || 1), STAGES.length);
           while (step > 1 && !stepReady(step)) step -= 1;
           /* 글은 저장된 그대로 보여 주고, 이미지는 불러오는 동안 '불러오는 중'으로 표시합니다. */
-          lastSavedJson = JSON.stringify(snapshot());
+          lastSavedJson = "";
           setState({ step, imagesLoading: true }, true);
-          const loaded = await ImageDB.loadProject(pid);
+          const loaded = await ImageDB.loadAll(pid);
           if (state.projectId !== pid) return;
-          setState({ images: loaded.images, itemImages: loaded.itemImages, imagesLoading: false });
+          /* 데이터가 없는 단계의 이미지는 복원하지 않고 정리합니다. (참고 프로그램과 같은 처리) */
+          const orphan = Object.keys(BOARD_STAGES).filter(s => !stageItems(s).length);
+          orphan.forEach(s => {
+            if (loaded.images[s]) { loaded.images[s] = null; ImageDB.remove(pid, s); }
+            if (Object.keys(loaded.itemImages[s] || {}).length) { loaded.itemImages[s] = {}; ImageDB.removePrefix(`${pid}::item::${s}::`); }
+          });
+          state.images = loaded.images;
+          state.itemImages = loaded.itemImages;
+          let restored = 0;
+          for (const stage of Object.keys(BOARD_STAGES)) {
+            const items = stageItems(stage);
+            const hasItemImg = items.some(it => itemImg(stage, it.id));
+            if (items.length && hasItemImg && !state.images[stage]) {
+              try { await rebuildBoard(stage); restored += 1; } catch (e) { console.warn("보드 복원 실패", stage, e); }
+              if (state.projectId !== pid) return;
+            }
+          }
+          setState({ imagesLoading: false });
+          if (restored) persist(false);
           if (loaded.failed) toast("저장된 이미지를 불러오지 못했습니다. 분석 내용은 그대로 남아 있습니다.", "error");
           else if (d.hasPhoto && !loaded.images.source) toast("저장된 사진을 찾지 못했습니다. 분석 내용은 그대로 남아 있습니다.", "error");
         },
 
         async deleteProject(id) {
           if (!window.confirm("이 프로젝트와 사진, 생성된 이미지를 모두 지웁니다. 계속할까요?")) return;
-          await saveChain;
-          await Store.remove(id);
-          if (state.projectId === id) { releaseAllUrls(); Object.assign(state, blankProject()); lastSavedJson = ""; }
+          Store.remove(id);
+          if (state.projectId === id) { Object.assign(state, blankProject()); lastSavedJson = ""; }
           toast("프로젝트를 삭제했습니다.");
           render();
         },
 
         goHome() { persist(false); setState({ step: 0 }, true); },
-        async saveNow() { const r = await persist(true); if (r === "empty") toast("아직 저장할 내용이 없습니다."); },
+        saveNow() { const r = persist(true); if (r === "empty") toast("아직 저장할 내용이 없습니다."); },
 
         copyReport() { copyText(buildReport(), "리포트를 클립보드에 복사했습니다.", "cmf-reverse-report.txt"); },
         async exportPdf() {
@@ -2369,7 +2312,7 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
             <div>
               <h2 class="t-label text-slate-300 mb-3">저장된 프로젝트 ${projects.length}/${CONFIG.MAX_PROJECTS}</h2>
               ${projects.length ? `<ul class="space-y-2">${projects.map(p => {
-                const st = STAGES.find(s => s.n === p.step) || STAGES[0];
+                const st = STAGES.find(s => s.n === (p.data && p.data.step)) || STAGES[0];
                 return `<li class="flex items-center gap-2 bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
                   <button type="button" onclick="Actions.openProject('${escAttr(p.id)}')" class="flex-1 text-left min-w-0">
                     <span class="block t-small font-bold text-white truncate">${esc(p.title)}</span>
@@ -2684,17 +2627,17 @@ Translate the emotional quality into one coherent, sophisticated design-magazine
         else if (state.isAnalyzing) Actions.cancel();
       });
 
-      setInterval(() => { persist(false).catch(e => console.warn("자동 저장 실패", e)); }, CONFIG.AUTOSAVE_MS);
+      setInterval(() => { try { persist(false); } catch (e) { console.warn("자동 저장 실패", e); } }, CONFIG.AUTOSAVE_MS);
       window.addEventListener("beforeunload", () => { try { persist(false); } catch (e) { /* 무시 */ } });
       /* 휴대폰은 앱 전환 때 페이지가 그대로 종료될 수 있어 화면이 가려질 때 바로 저장합니다. */
-      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") persist(false); });
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { try { persist(false); } catch (e) { /* 무시 */ } } });
       window.addEventListener("pagehide", () => { try { persist(false); } catch (e) { /* 무시 */ } });
       try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* 무시 */ }
 
       loadSession();
       if (state.apiKey) state.step = 0;
       render(true);
-      Store.migrate().then(() => { if (state.step === 0) render(); });
+      Store.migrateFromIdb().then(moved => { if (moved && state.step === 0) render(); });
     })();
   </script>
 </body>
