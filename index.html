@@ -108,7 +108,9 @@
         SESSION_KEY_API: "cmf_reverse_openai_key_v2",
         SESSION_KEY_PREFS: "cmf_reverse_prefs_v2",
         PROJECTS_KEY: "cmf_reverse_projects_v2",
-        DB: { name: "cmf_reverse_images_v2", version: 2, images: "images", projects: "projects" },
+        DB: { name: "cmf_reverse_images_v2", images: "images", projects: "projects" },
+        PROJECT_DB: "cmf_reverse_projects_v4",
+        BACKUP_KEY: "cmf_reverse_last_project_v4",
         MAX_PROJECTS: 5,
         AUTOSAVE_MS: 5000,
         IMAGE_SIZE: "1024x1536",
@@ -556,7 +558,7 @@ Set the new caption in the same font, weight, size and white strip as the other 
       }
 
       /* =========================================================
-         5. 저장소 — 프로젝트와 이미지 모두 IndexedDB
+         5. 저장소 — 프로젝트와 이미지 모두 IndexedDB (프로젝트는 별도 DB)
          localStorage는 브라우저 전체가 약 5MB를 함께 쓰기 때문에 같은 주소의 다른 도구와
          용량을 나눠 쓰다 쉽게 가득 찹니다. IndexedDB는 훨씬 큰 공간을 쓸 수 있습니다.
          그래도 공간이 부족하면 지금 작업 중인 프로젝트를 뺀 가장 오래된 프로젝트부터
@@ -565,34 +567,55 @@ Set the new caption in the same font, weight, size and white strip as the other 
       const IMAGE_SLOTS = ["source", "cmf", "property", "perception", "emotion"];
       const blankImages = () => ({ source: null, cmf: null, property: null, perception: null, emotion: null });
 
-      let dbPromise = null;
+      /* ---------------------------------------------------------
+         IndexedDB 열기
+         - 버전을 지정하지 않고 엽니다. 예전 버전(v3)이 다른 탭에 열려 있어도
+           업그레이드 충돌(차단)이 생기지 않습니다.
+         - 필요한 저장소가 없을 때만 버전을 올려 만듭니다.
+         - '차단됨' 신호가 와도 바로 실패하지 않고 다른 탭이 닫힐 때까지 기다립니다.
+         --------------------------------------------------------- */
+      const dbCache = {};
+      function openDb(name, stores) {
+        if (!("indexedDB" in window) || !window.indexedDB) return Promise.reject(new Error("IDB_UNAVAILABLE"));
+        if (dbCache[name]) return dbCache[name];
+        const attempt = version => new Promise((res, rej) => {
+          let req;
+          try { req = version ? indexedDB.open(name, version) : indexedDB.open(name); } catch (e) { rej(e); return; }
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            stores.forEach(s => { if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: "id" }); });
+          };
+          req.onsuccess = () => res(req.result);
+          req.onerror = () => rej(req.error || new Error("IDB_OPEN_FAILED"));
+          req.onblocked = () => { console.warn(`${name}: 다른 탭이 저장소를 쓰고 있어 기다립니다.`); };
+        });
+        const p = (async () => {
+          let db = await attempt(0);
+          if (!stores.every(s => db.objectStoreNames.contains(s))) {
+            const v = db.version + 1;
+            db.close();
+            db = await attempt(v);
+          }
+          db.onversionchange = () => { try { db.close(); } catch (e) { /* 무시 */ } delete dbCache[name]; };
+          db.onclose = () => { delete dbCache[name]; };
+          return db;
+        })();
+        const timed = Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("IDB_TIMEOUT")), 15000))]);
+        dbCache[name] = timed;
+        timed.catch(() => { if (dbCache[name] === timed) delete dbCache[name]; });
+        return timed;
+      }
+
+      const DBS = {
+        images: { name: CONFIG.DB.name, stores: [CONFIG.DB.images] },
+        projects: { name: CONFIG.PROJECT_DB, stores: [CONFIG.DB.projects] }
+      };
+      const dbFor = store => (store === CONFIG.DB.images ? DBS.images : DBS.projects);
+
       const DB = {
-        open() {
-          if (!("indexedDB" in window) || !window.indexedDB) return Promise.reject(new Error("IDB_UNAVAILABLE"));
-          if (dbPromise) return dbPromise;
-          dbPromise = new Promise((res, rej) => {
-            let req;
-            try { req = indexedDB.open(CONFIG.DB.name, CONFIG.DB.version); } catch (e) { rej(e); return; }
-            req.onupgradeneeded = () => {
-              const db = req.result;
-              [CONFIG.DB.images, CONFIG.DB.projects].forEach(s => {
-                if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: "id" });
-              });
-            };
-            req.onsuccess = () => {
-              const db = req.result;
-              db.onversionchange = () => { try { db.close(); } catch (e) { /* 무시 */ } dbPromise = null; };
-              res(db);
-            };
-            req.onerror = () => rej(req.error || new Error("IDB_OPEN_FAILED"));
-            req.onblocked = () => rej(new Error("IDB_BLOCKED"));
-          });
-          dbPromise.catch(() => { dbPromise = null; });
-          return dbPromise;
-        },
         /* 용량 초과는 요청이 아니라 트랜잭션 중단(abort)으로 알려지므로 트랜잭션 완료를 기준으로 판단합니다. */
-        run(storeName, mode, fn) {
-          return DB.open().then(db => new Promise((res, rej) => {
+        runOn(db, storeName, mode, fn) {
+          return new Promise((res, rej) => {
             let tx;
             try { tx = db.transaction(storeName, mode); } catch (e) { rej(e); return; }
             let result;
@@ -603,7 +626,11 @@ Set the new caption in the same font, weight, size and white strip as the other 
             tx.oncomplete = () => res(result);
             tx.onerror = () => rej(tx.error || rq.error || new Error("IDB_REQUEST_FAILED"));
             tx.onabort = () => rej(tx.error || new Error("IDB_ABORTED"));
-          }));
+          });
+        },
+        run(storeName, mode, fn) {
+          const d = dbFor(storeName);
+          return openDb(d.name, d.stores).then(db => DB.runOn(db, storeName, mode, fn));
         },
         put: (s, v) => DB.run(s, "readwrite", st => st.put(v)),
         get: (s, k) => DB.run(s, "readonly", st => st.get(k)),
@@ -647,53 +674,138 @@ Set the new caption in the same font, weight, size and white strip as the other 
         }
       };
 
+      /* ---------------------------------------------------------
+         예비 사본 — 마지막으로 저장한 프로젝트 한 개를 localStorage에도 남깁니다.
+         IndexedDB 기록이 늦거나 실패해도 마지막 수정이 사라지지 않게 하는 안전장치입니다.
+         (이미지는 넣지 않으므로 수십 KB 수준입니다.)
+         --------------------------------------------------------- */
+      const Backup = {
+        read() {
+          try {
+            const raw = localStorage.getItem(CONFIG.BACKUP_KEY);
+            const r = raw ? JSON.parse(raw) : null;
+            return r && r.id && r.data ? r : null;
+          } catch (e) { return null; }
+        },
+        write(row) {
+          try { localStorage.setItem(CONFIG.BACKUP_KEY, JSON.stringify(row)); return true; }
+          catch (e) { return false; }
+        },
+        clearIf(id) {
+          const b = Backup.read();
+          if (b && b.id === id) { try { localStorage.removeItem(CONFIG.BACKUP_KEY); } catch (e) { /* 무시 */ } }
+        }
+      };
+
+      const newer = (a, b) => (!a ? b : (!b ? a : ((b.savedAt || 0) > (a.savedAt || 0) ? b : a)));
+
+      /* 같은 프로젝트가 여러 곳에 있으면 가장 최근에 저장된 것을 고릅니다. */
+      function mergeRows(lists) {
+        const map = {};
+        lists.forEach(list => (list || []).forEach(r => {
+          if (r && r.id && r.data) map[r.id] = newer(map[r.id], r);
+        }));
+        return Object.keys(map).map(k => map[k]);
+      }
+
       const Store = {
         ready: false,
         mode: "idb",
         cache: [],
         lastSig: {},
+        failedSig: {},
         queue: Promise.resolve(),
 
-        async init() {
-          let legacy = [];
+        readLegacy() {
           try {
             const raw = localStorage.getItem(CONFIG.PROJECTS_KEY);
             const l = raw ? JSON.parse(raw) : [];
-            if (Array.isArray(l)) legacy = l.filter(p => p && p.id);
-          } catch (e) { /* 저장소 차단 환경 */ }
+            return Array.isArray(l) ? l.filter(p => p && p.id) : [];
+          } catch (e) { return []; }
+        },
 
+        /* 이전 v4가 이미지 저장소 안에 두던 프로젝트 기록 — 업그레이드 없이 읽기만 합니다. */
+        async readOldV4() {
           try {
-            const rows = await Promise.race([
-              DB.getAll(CONFIG.DB.projects),
-              new Promise((_, rej) => setTimeout(() => rej(new Error("IDB_TIMEOUT")), 5000))
-            ]);
-            const list = Array.isArray(rows) ? rows.filter(p => p && p.id) : [];
-            for (const p of legacy) {
-              if (list.some(x => x.id === p.id)) continue;
-              try { await DB.put(CONFIG.DB.projects, p); list.push(p); }
-              catch (e) { console.warn("예전 프로젝트를 옮기지 못했습니다.", e); }
+            const db = await openDb(DBS.images.name, DBS.images.stores);
+            if (!db.objectStoreNames.contains(CONFIG.DB.projects)) return [];
+            const rows = await DB.runOn(db, CONFIG.DB.projects, "readonly", st => st.getAll());
+            return Array.isArray(rows) ? rows.filter(p => p && p.id) : [];
+          } catch (e) { return []; }
+        },
+        async clearOldV4(ids) {
+          try {
+            const db = await openDb(DBS.images.name, DBS.images.stores);
+            if (!db.objectStoreNames.contains(CONFIG.DB.projects)) return;
+            for (const id of ids) await DB.runOn(db, CONFIG.DB.projects, "readwrite", st => st.delete(id));
+          } catch (e) { /* 무시 */ }
+        },
+
+        async init() {
+          const legacy = Store.readLegacy();
+          const backup = Backup.read();
+          try {
+            const current = await DB.getAll(CONFIG.DB.projects);
+            const curList = Array.isArray(current) ? current.filter(p => p && p.id) : [];
+            const oldV4 = await Store.readOldV4();
+            const merged = mergeRows([curList, oldV4, legacy, backup ? [backup] : []]);
+
+            /* IndexedDB에 있는 것보다 새로운 기록만 옮겨 적습니다. */
+            let allMoved = true;
+            for (const r of merged) {
+              const inDb = curList.find(x => x.id === r.id);
+              if (inDb && (inDb.savedAt || 0) >= (r.savedAt || 0)) continue;
+              try { await DB.put(CONFIG.DB.projects, r); }
+              catch (e) { allMoved = false; console.warn("예전 기록을 옮기지 못했습니다.", e); }
             }
-            /* 옮긴 뒤에는 localStorage를 비워 다른 도구와 함께 쓰는 공간을 돌려줍니다. */
-            if (legacy.length) { try { localStorage.removeItem(CONFIG.PROJECTS_KEY); } catch (e) { /* 무시 */ } }
+            /* 모두 안전하게 옮긴 뒤에만 예전 기록을 지웁니다. */
+            if (allMoved) {
+              if (legacy.length) { try { localStorage.removeItem(CONFIG.PROJECTS_KEY); } catch (e) { /* 무시 */ } }
+              if (oldV4.length) await Store.clearOldV4(oldV4.map(r => r.id));
+            }
             Store.mode = "idb";
-            Store.cache = list;
+            Store.cache = merged;
           } catch (e) {
             console.warn("IndexedDB를 쓸 수 없어 브라우저 기본 저장소를 사용합니다.", e);
             Store.mode = "ls";
-            Store.cache = legacy;
+            Store.cache = mergeRows([legacy, backup ? [backup] : []]);
           }
 
           Store.cache.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
           const extra = Store.cache.slice(CONFIG.MAX_PROJECTS);
           Store.cache = Store.cache.slice(0, CONFIG.MAX_PROJECTS);
           for (const p of extra) await Store._purge(p.id);
-          if (Store.mode === "ls" && extra.length) {
+          if (Store.mode === "ls") {
             try { localStorage.setItem(CONFIG.PROJECTS_KEY, JSON.stringify(Store.cache)); } catch (e) { /* 무시 */ }
           }
           Store.ready = true;
 
           /* 브라우저가 공간이 부족할 때 임의로 지우지 않도록 영구 저장을 요청합니다. */
           try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* 무시 */ }
+        },
+
+        /* 다른 탭이나 창에서 저장한 내용까지 반영해 목록을 새로 읽습니다. */
+        async refresh() {
+          if (!Store.ready || Store.mode !== "idb") return;
+          try {
+            const rows = await DB.getAll(CONFIG.DB.projects);
+            const b = Backup.read();
+            const merged = mergeRows([Store.cache, rows, b ? [b] : []])
+              .filter(r => (rows || []).some(x => x.id === r.id) || Store.cache.some(x => x.id === r.id));
+            merged.sort((a, c) => (c.savedAt || 0) - (a.savedAt || 0));
+            Store.cache = merged.slice(0, CONFIG.MAX_PROJECTS);
+          } catch (e) { /* 읽기 실패 시 기존 목록 유지 */ }
+        },
+
+        /* 프로젝트를 열 때는 메모리 목록이 아니라 저장소에서 가장 최근 기록을 직접 읽습니다. */
+        async fetchLatest(id) {
+          let row = Store.cache.find(p => p.id === id) || null;
+          if (Store.mode === "idb") {
+            try { row = newer(row, await DB.get(CONFIG.DB.projects, id)); } catch (e) { /* 메모리 기록 사용 */ }
+          }
+          const b = Backup.read();
+          if (b && b.id === id) row = newer(row, b);
+          return row && row.data ? row : null;
         },
 
         list() { return Store.cache.slice(); },
@@ -707,6 +819,7 @@ Set the new caption in the same font, weight, size and white strip as the other 
         async _purge(id) {
           if (Store.mode === "idb") { try { await DB.del(CONFIG.DB.projects, id); } catch (e) { /* 무시 */ } }
           await ImageDB.removeProject(id);
+          Backup.clearIf(id);
           delete Store.lastSig[id];
         },
 
@@ -727,7 +840,11 @@ Set the new caption in the same font, weight, size and white strip as the other 
           try { sig = `${meta.title}\u0000${JSON.stringify(snap)}`; } catch (e) { return { ok: false }; }
           if (Store.lastSig[meta.id] === sig && Store.cache.some(p => p.id === meta.id)) return { ok: true, unchanged: true, freed: [] };
 
-          const row = { id: meta.id, title: meta.title, savedAt: Date.now(), data: snap };
+          /* 저장 순간의 내용을 깊은 복사로 고정해 이후 화면 변경과 섞이지 않게 합니다. */
+          const row = { id: meta.id, title: meta.title, savedAt: Date.now(), data: JSON.parse(JSON.stringify(snap)) };
+          /* 예비 사본을 먼저 남깁니다. 아래 기록이 실패해도 다음 실행 때 이 사본으로 복구됩니다. */
+          Backup.write(row);
+
           Store.cache = [row].concat(Store.cache.filter(p => p.id !== meta.id));
           while (Store.cache.length > CONFIG.MAX_PROJECTS) {
             const old = Store.cache.pop();
@@ -739,11 +856,22 @@ Set the new caption in the same font, weight, size and white strip as the other 
             try {
               await Store._writeRow(row);
               Store.lastSig[meta.id] = sig;
-              return { ok: true, freed };
+              const firstFail = !!Store.failedSig[meta.id];
+              delete Store.failedSig[meta.id];
+              return { ok: true, freed, recovered: firstFail };
             } catch (e) {
-              if (!isQuotaError(e)) { console.warn("프로젝트 저장 실패", e); return { ok: false }; }
+              if (!isQuotaError(e)) {
+                console.warn("프로젝트 저장 실패", e);
+                const repeat = Store.failedSig[meta.id] === sig;
+                Store.failedSig[meta.id] = sig;
+                return { ok: false, repeat };
+              }
               const victim = Store.oldestExcept(meta.id);
-              if (!victim) return { ok: false, full: true };
+              if (!victim) {
+                const repeat = Store.failedSig[meta.id] === sig;
+                Store.failedSig[meta.id] = sig;
+                return { ok: false, full: true, repeat };
+              }
               Store.cache = Store.cache.filter(p => p.id !== victim.id);
               await Store._purge(victim.id);
               freed.push(victim.title);
@@ -1311,6 +1439,7 @@ Set the new caption in the same font, weight, size and white strip as the other 
       /* 홈으로 나가며 저장할 때 step이 0이 되어 1로 기록되지 않도록
          마지막으로 작업하던 단계를 따로 기억해 둡니다. */
       let lastWorkStep = 1;
+      let opening = false;
 
       function snapshot() {
         return {
@@ -1346,7 +1475,6 @@ Set the new caption in the same font, weight, size and white strip as the other 
         return name || "이름 없는 프로젝트";
       }
 
-      let quotaWarned = false;
       function persist(showToast) {
         if (!hasContent()) {
           if (showToast) toast("아직 저장할 내용이 없습니다.");
@@ -1361,13 +1489,13 @@ Set the new caption in the same font, weight, size and white strip as the other 
         const meta = { id: state.projectId, title: projectTitle() };
         return Store.save(snap, meta).then(r => {
           if (r.ok) {
-            quotaWarned = false;
             if (showToast) toast("진행 상태를 저장했습니다.");
+            else if (r.recovered) toast("밀려 있던 변경 내용을 저장했습니다.");
             if (r.freed && r.freed.length) toast(`저장 공간을 확보하려고 오래된 프로젝트 ${r.freed.length}개를 정리했습니다.`);
             return "ok";
           }
-          if (!quotaWarned || showToast) {
-            quotaWarned = true;
+          /* 새로운 변경이 저장되지 못할 때마다 알립니다. 같은 내용의 자동 재시도는 조용히 처리합니다. */
+          if (!r.repeat || showToast) {
             toast(r.full
               ? "브라우저 저장 공간이 가득 차 이 프로젝트를 저장하지 못했습니다. PDF로 내려받아 보관해 주세요."
               : "진행 상태를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.", "error");
@@ -1475,7 +1603,6 @@ Set the new caption in the same font, weight, size and white strip as the other 
             ${url ? ghostBtn("이미지 저장", `Actions.downloadImage('${slot}')`, "download") : ""}
           </div>
           ${inner}
-          ${opts.caption ? `<p class="t-meta text-slate-500 mt-3 px-1 prose-ko">${esc(opts.caption)}</p>` : ""}
         </section>`;
       }
 
@@ -1889,10 +2016,17 @@ Set the new caption in the same font, weight, size and white strip as the other 
         },
 
         async openProject(id) {
-          const row = Store.list().find(p => p.id === id);
+          if (opening) return;
+          opening = true;
+          let row;
+          try {
+            /* 지금 열려 있던 프로젝트를 먼저 끝까지 저장한 뒤, 저장소에서 가장 최근 기록을 읽습니다. */
+            await persist(false);
+            await Store.queue;
+            row = await Store.fetchLatest(id);
+          } finally { opening = false; }
           if (!row || !row.data) { toast("프로젝트를 찾지 못했습니다.", "error"); return; }
-          persist(false);
-          const d = row.data;
+          const d = JSON.parse(JSON.stringify(row.data));
           Object.assign(state, blankProject(), {
             projectId: d.projectId || row.id,
             keyword: d.keyword || "",
@@ -1926,7 +2060,10 @@ Set the new caption in the same font, weight, size and white strip as the other 
           render();
         },
 
-        goHome() { persist(false); setState({ step: 0 }, true); },
+        goHome() {
+          setState({ step: 0 }, true);
+          persist(false).then(() => Store.queue).then(() => Store.refresh()).then(() => { if (state.step === 0) render(); });
+        },
         saveNow() { persist(true); },
 
         copyReport() { copyText(buildReport(), "리포트를 클립보드에 복사했습니다.", "cmf-reverse-report.txt"); },
@@ -2384,7 +2521,6 @@ Set the new caption in the same font, weight, size and white strip as the other 
           ${imageCard("property", {
             title: "물성 통합 이미지",
             alt: "물성별 대표 표면·광학·촉감 이미지 보드",
-            caption: "각 물성을 대표하는 이미지를 한 장의 에디토리얼 보드로 묶었습니다.",
             empty: "물성 통합 이미지를 아직 만들지 않았습니다.",
             onGenerate: "Actions.generatePropertyImage()"
           })}
@@ -2423,7 +2559,6 @@ Set the new caption in the same font, weight, size and white strip as the other 
           ${imageCard("perception", {
             title: "지각 분석 통합 이미지",
             alt: "지각 특성을 영감 관점으로 표현한 디자인 매거진 스타일 이미지",
-            caption: "분석한 대상을 직접 반복하지 않고, 지각 특성을 가장 잘 드러내는 건축·패션·자연·조명·가구·일러스트 등 영감의 관점으로 시각화했습니다.",
             empty: "지각 분석 영감 이미지를 아직 만들지 않았습니다.",
             onGenerate: "Actions.generatePerceptionImage()"
           })}
@@ -2471,7 +2606,6 @@ Set the new caption in the same font, weight, size and white strip as the other 
           ${imageCard("emotion", {
             title: "대표 감성 키워드 이미지",
             alt: "사물 경험에서 도출된 주요 감성들의 무드 이미지",
-            caption: "사용자가 최종적으로 갖게 되는 대표 경험 감성 2개를 전문적인 디자인 잡지 이미지처럼 세련되게 시각화했습니다.",
             empty: "대표 감성 키워드 이미지를 아직 만들지 않았습니다.",
             onGenerate: "Actions.generateEmotionImage()"
           })}
@@ -2495,7 +2629,8 @@ Set the new caption in the same font, weight, size and white strip as the other 
           html += `<div class="fixed inset-0 z-[10000] bg-white/95 backdrop-blur-sm flex flex-col items-center justify-center px-8 text-center max-w-[430px] mx-auto animate-fade-in" role="status" aria-live="polite">
             <div class="spinner-ring mb-8" role="presentation"></div>
             <h2 class="t-h2 text-slate-900 mb-2 w-full prose-center">${esc(state.loadingMsg)}</h2>
-            <p class="t-small text-slate-600 mb-8 w-full prose-center">1분 넘게 걸릴 수 있습니다</p>
+            <p class="t-small text-slate-600 mb-2 w-full prose-center">1분 넘게 걸릴 수 있습니다</p>
+            <p class="t-small text-slate-600 mb-8 w-full prose-center">처리 중에는 화면을 켜 두고 다른 앱으로 전환하지 마세요</p>
             <button type="button" onclick="Actions.cancel()" class="px-7 py-3.5 rounded-2xl border-2 border-slate-300 text-slate-700 font-bold t-small hover:bg-slate-50 active:scale-95 transition-all">취소</button>
           </div>`;
         }
@@ -2600,7 +2735,11 @@ Set the new caption in the same font, weight, size and white strip as the other 
       });
 
       setInterval(() => { persist(false); }, CONFIG.AUTOSAVE_MS);
+      /* 모바일·앱(WebView)은 창을 닫을 때 beforeunload가 오지 않는 경우가 많아
+         화면이 가려지는 순간에도 바로 저장합니다. */
       window.addEventListener("beforeunload", () => { persist(false); });
+      window.addEventListener("pagehide", () => { persist(false); });
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") persist(false); });
 
       loadSession();
       if (state.apiKey) state.step = 0;
