@@ -2763,8 +2763,10 @@ Set the new caption in the same font, weight, size and white strip as the other 
             if (r && typeof r.catch === "function") r.catch(() => {});
           } catch (err) { /* 지원하지 않는 환경 */ }
         };
-        document.addEventListener("click", enter, true);
-        document.addEventListener("touchend", enter, { capture: true, passive: true });
+        /* 손가락을 떼는 순간(touchend)에 전환하면 주소창이 사라지며 화면이 밀려
+           누른 버튼(예: 홈)이 아닌 곳이 눌릴 수 있습니다. 그래서 클릭 시점에만 전환하고,
+           누른 버튼의 동작이 먼저 실행된 뒤 전환되도록 버블 단계에서 처리합니다. */
+        document.addEventListener("click", e => { enter(e); }, false);
       })();
 
       setInterval(() => { persist(false); }, CONFIG.AUTOSAVE_MS);
