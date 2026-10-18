@@ -3,11 +3,6 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <!-- 홈 화면에 추가해 실행하면 주소창 없이 앱처럼 열립니다 -->
-  <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="theme-color" content="#ffffff" />
   <title>사물 · 물성 · 지각 · 감성 랩 v4</title>
 
   <script src="https://cdn.tailwindcss.com"></script>
@@ -2738,36 +2733,6 @@ Set the new caption in the same font, weight, size and white strip as the other 
         else if (state.lightbox) Actions.closeLightbox();
         else if (state.isAnalyzing) Actions.cancel();
       });
-
-      /* ---------------------------------------------------------
-         스마트폰 전체 화면
-         브라우저는 사용자가 화면을 누를 때만 전체 화면을 허용하므로,
-         터치 화면에서 처음 누르는 순간 전체 화면으로 전환합니다.
-         사진 선택·카메라 창이 열렸다 닫히며 전체 화면이 풀리면 다음 터치에서 다시 켭니다.
-         --------------------------------------------------------- */
-      (function setupFullscreen() {
-        const isTouch = (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) || ("ontouchstart" in window);
-        const standalone = (window.matchMedia && window.matchMedia("(display-mode: standalone), (display-mode: fullscreen)").matches) || navigator.standalone === true;
-        if (!isTouch || standalone) return;
-        const de = document.documentElement;
-        const request = de.requestFullscreen || de.webkitRequestFullscreen;
-        if (!request) return; /* 아이폰 Safari는 웹페이지 전체 화면을 지원하지 않습니다. */
-        const isFull = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
-        const enter = e => {
-          if (isFull()) return;
-          /* 사진 찍기·올리기 버튼은 파일 선택 창이 먼저 열려야 하므로 건너뜁니다. */
-          const t = e && e.target;
-          if (t && t.closest && t.closest('label[for^="file-"], input[type="file"], a[download], a[target="_blank"]')) return;
-          try {
-            const r = request.call(de, { navigationUI: "hide" });
-            if (r && typeof r.catch === "function") r.catch(() => {});
-          } catch (err) { /* 지원하지 않는 환경 */ }
-        };
-        /* 손가락을 떼는 순간(touchend)에 전환하면 주소창이 사라지며 화면이 밀려
-           누른 버튼(예: 홈)이 아닌 곳이 눌릴 수 있습니다. 그래서 클릭 시점에만 전환하고,
-           누른 버튼의 동작이 먼저 실행된 뒤 전환되도록 버블 단계에서 처리합니다. */
-        document.addEventListener("click", e => { enter(e); }, false);
-      })();
 
       setInterval(() => { persist(false); }, CONFIG.AUTOSAVE_MS);
       /* 모바일·앱(WebView)은 창을 닫을 때 beforeunload가 오지 않는 경우가 많아
