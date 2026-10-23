@@ -404,7 +404,20 @@ ${format}`;
          ========================================================= */
       const IMG_BASE = `Editorial imagery for a high-end design magazine. Premium image quality, professional lighting, convincing material and atmospheric detail where appropriate, natural tonal depth, no watermark, no logo, no signature. Preserve the chosen style faithfully rather than forcing every panel to look equally sharp. Avoid conventional posed portraits and identifiable faces; hands, back views or partial figures are fine when a scene genuinely needs a person.`;
 
-      const IMG_LABEL_RULE = `Label typography, applied to every numbered label in the image: set each label on its own clean white caption strip, with the leading number in bold and the Korean title followed immediately by the English title on the SAME LINE in regular weight, in a neutral sans-serif on white. Do not place English on a second line. The label text must be large and unmistakably legible — letters at least 40 pixels tall in this 1024 x 1536 image. Never set label text smaller than that; if space is tight make the caption strip taller rather than shrinking the type. Render only the label text specified below and no other lettering anywhere in the image.`;
+      /* 이미지 보드 제목 글씨 — 감성 · 지각 · 물성 · CMF 랩(CMF-emotional-process)과 같은 규칙입니다.
+         가로 1024px 이미지에서 글자 높이 약 54px(이미지 폭의 약 5.3%), 굵은 한글 산세리프(Pretendard 계열),
+         번호와 한글 제목만 왼쪽 정렬로 넣고 영어는 넣지 않습니다. */
+      const CAPTION_SIZE = `Caption text size — identical on the emotion, perception and property boards of this project: large, bold captions with Korean glyphs about 54 pixels tall in this 1024 x 1536 image (a font size of about 56 px, roughly 5.3% of the full image width). Reference: on a two-column board, the caption "01 먼 곳까지 또렷한 빛" at this size is about as wide as the whole cell. Every caption on every board uses exactly this size: never smaller than 48 px glyph height and never larger than 60 px; do not shrink a caption to fit the cell or a long title — if the title does not fit on one line, wrap it onto a second line at the same size and make the caption strip taller (shrink the image area above instead). Number and title are both set in bold, near-black, in one neutral modern Korean sans-serif (Pretendard-like).`;
+
+      const IMG_LABEL_RULE = `Label typography, applied to every label in the image: set each label on its own clean white caption strip, left-aligned, with the leading number followed by the Korean title only, on white. Korean only — absolutely no English words, no romanization or translation. ${CAPTION_SIZE} Render only the label text specified below and no other lettering anywhere in the image.`;
+
+      /* 지각·물성 보드 공통 글씨 규칙 */
+      const KO_BOARD_TYPO = `Caption typography — exactly identical on the perception board and the property board of this project:
+- Every item has ONE clean white caption strip placed directly beneath its image, the same height for every item on the board.
+- Caption content: the two-digit number, a single space, then the Korean title exactly as specified. Korean only — absolutely no English words, no romanization, no translation, no description or badge.
+- Font and size: ${CAPTION_SIZE} Left-aligned on white with the same inner padding for every caption; a long title wraps to a second line at the same size rather than shrinking, and every caption strip on the board keeps the same height.
+- Image area above the caption: same corner radius, same thin light-grey hairline border, same gutters between items.
+- No board title, header, footer, page number or any other lettering anywhere in the image.`;
 
       const pad2 = n => String(n).padStart(2, "0");
       const q = s => String(s || "").replace(/"/g, "'");
@@ -417,22 +430,17 @@ ${format}`;
         return Array.from(new Set(items.map((it, i) => styleOf(it, i).name))).join(", ");
       }
 
-      /* 이미지에 찍을 라벨 — 설정에 따라 한글을 함께 넣습니다. */
-      function labelLine(ko, en, i) {
-        return state.labelLang === "ko" && ko
-          ? `"${pad2(i + 1)}" in bold followed by "${q(ko)}  ${q(en)}" on the SAME line`
-          : `"${pad2(i + 1)}" in bold followed by "${q(en)}"`;
+      /* 이미지에 찍을 라벨 — 화면 카드 제목과 같은 한글 제목만 넣습니다(영어 없음). */
+      function labelLine(ko, i) {
+        return ko ? `"${pad2(i + 1)}" in bold followed by "${q(ko)}"` : `"${pad2(i + 1)}" in bold`;
       }
 
       const IMG = {
         /* ---- 칸 하나를 설명하는 문장 (전체 보드와 부분 편집이 같은 문장을 씁니다) ---- */
         propertyCell(p, i) {
-          return `Card ${i + 1}:
-  Header text on white: ${state.labelLang === "ko" && p.titleKo
-            ? `"${pad2(i + 1)}" in bold followed by "${q(p.titleKo)}" and a smaller second line "${q(p.titleEn)}"`
-            : `"${pad2(i + 1)}" in bold followed by "${q(p.titleEn)}"`}.
-  Optional small axis badge: "${q(p.axis)}".
-  Image direction: ${p.visual || p.description}`;
+          return `Cell ${i + 1} — property "${q(p.titleKo)}":
+  Image direction: ${p.visual || p.description}
+  White caption strip directly under this image: ${labelLine(p.titleKo || p.labelKo, i)}. Korean only, same large size.`;
         },
         perceptionCell(p, i) {
           const st = styleOf(p, i);
@@ -441,7 +449,7 @@ ${format}`;
   What is perceived: ${p.titleEn} / ${p.titleKo}.
   Single-scene direction: ${p.visual}
   Demonstrate the perceptual experience itself — visual, tactile, spatial, weight/force, movement, response, sound, temporal or use-related — rather than making a generic beauty shot. Do not depict the analysed object itself.
-  White caption strip directly under this image: ${labelLine(p.labelKo || p.titleKo, p.label || p.titleEn, i)}.`;
+  White caption strip directly under this image: ${labelLine(p.titleKo || p.labelKo, i)}. Korean only, same large size.`;
         },
         emotionPanel(l, i) {
           const st = styleOf(l, i);
@@ -450,17 +458,19 @@ ${format}`;
   Relative intensity: ${Number.isFinite(Number(l.intensity)) ? Math.round(Number(l.intensity)) : 60}/100.
   Single-scene direction: ${l.visual}
   Translate the emotional quality into one coherent design-magazine scene; do not simply repeat the analysed object.
-  Caption strip along the bottom edge: ${labelLine(l.labelKo || l.nameKo, l.label || l.nameEn, i)}.`;
+  Caption strip along the bottom edge of this panel: ${labelLine(l.nameKo || l.labelKo, i)}. Korean only, same large size.`;
         },
 
         property(items) {
           return `${IMG_BASE}
-Create ONE single vertical 2:3 integrated image file that presents exactly ${items.length} material-and-physical-property cards on a clean premium editorial board.
-Layout: a compact multi-row two-column grid of bordered white cards with thin light-grey lines and generous outer margins. Fit all cards cleanly on one board.
-Each card contains ONE image that clearly communicates the property or response: optical behaviour, texture, friction, stiffness, compression, weight/inertia, bending, motion, recovery, vibration, sound, thermal response, wear, or another specified phenomenon.
+Create ONE single vertical 2:3 integrated image file that presents exactly ${items.length} material-and-physical-property images on a clean premium editorial board.
+Layout: Cells 01–${pad2(items.length)} form a balanced 2-column × ${Math.ceil(items.length / 2)}-row grid. Each cell contains one image plus a separate white caption strip directly beneath it. Use thin light-grey hairlines, consistent gutters, generous white margins, and no extra cells or subdivisions.
+Each image clearly communicates the property or response: optical behaviour, texture, friction, stiffness, compression, weight/inertia, bending, motion, recovery, vibration, sound, thermal response, wear, or another specified phenomenon.
 The original object may appear when needed to show motion, force, contact or structural response; do not reduce every property to a generic surface sample.
-One property, one image, one card. Render only the specified card texts and no extra paragraphs.
-${items.map((p, i) => IMG.propertyCell(p, i)).join("\n")}`;
+One property, one image, one caption. Render only the specified caption texts and no extra paragraphs.
+${items.map((p, i) => IMG.propertyCell(p, i)).join("\n")}
+
+${KO_BOARD_TYPO}`;
         },
         perception(items) {
           return `${IMG_BASE}
@@ -476,14 +486,15 @@ ${items.map((p, i) => IMG.perceptionCell(p, i)).join("\n")}
 - No identifiable faces; hands or partial bodies only when they help explain contact, force, posture, movement or use.
 - Avoid repeating the same composition.
 - Styles used: ${styleNote(items)}.
-${IMG_LABEL_RULE}`;
+
+${KO_BOARD_TYPO}`;
         },
         emotion(emotion) {
           const layers = emotion.layers || [];
           return `${IMG_BASE}
 Generate ONE single vertical 2:3 editorial mood board containing exactly ${layers.length === 1 ? "ONE" : "TWO"} refined emotion image${layers.length === 1 ? "" : "s"} derived from the analysed object.
 These are the most representative experience-based emotional keywords a user is left with after encountering the object.
-Layout: equal full-width panels stacked vertically, with narrow white outer margins, thin light-grey dividers and clean caption strips.
+Layout: equal full-width panels stacked vertically, with narrow white outer margins, thin light-grey dividers and a clean white caption strip at the bottom of each panel.
 Each panel should feel like a premium design-magazine image similar in sophistication to the perception imagery. Use elegant scenes, not infographic symbols.
 ${layers.map((l, i) => IMG.emotionPanel(l, i)).join("\n")}
 ${IMG_LABEL_RULE}`;
@@ -500,7 +511,7 @@ ${IMG_LABEL_RULE}`;
         /* 기존 통합 이미지에서 한 칸만 바꾸는 편집 프롬프트 */
         edit(key, idx) {
           const map = {
-            property:   { unit: "card",  list: state.properties, cell: IMG.propertyCell },
+            property:   { unit: "cell",  list: state.properties, cell: IMG.propertyCell },
             perception: { unit: "cell",  list: state.perceptions, cell: IMG.perceptionCell },
             emotion:    { unit: "panel", list: state.emotion ? state.emotion.layers : [], cell: IMG.emotionPanel }
           };
@@ -512,7 +523,7 @@ Change ONLY ${spec.unit} ${n} — the ${spec.unit} whose caption starts with "${
 Keep everything else exactly as it is: every other ${spec.unit}'s picture, crop, colours, lighting and caption text; the grid, gutters, hairlines, margins, background, overall layout and typography. Do not redraw, restyle, reorder, renumber or re-letter anything outside ${spec.unit} ${n}.
 New content for ${spec.unit} ${n}:
 ${spec.cell(item, idx - 1)}
-Set the new caption in the same font, weight, size and white strip as the other captions, large and clearly legible. Add no other new text anywhere. No watermark, no logo, no identifiable faces.`;
+Set the new caption in the same font, weight, size and white strip as the other captions: the number and the Korean title only, Korean only with no English, bold near-black Korean sans-serif (Pretendard-like) with glyphs about 54 pixels tall, left-aligned. Add no other new text anywhere. No watermark, no logo, no identifiable faces.`;
         }
       };
 
