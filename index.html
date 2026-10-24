@@ -18,6 +18,9 @@
        역방향 도구임을 구분하도록 강조색만 청록(teal)으로 바꿉니다.
        ========================================================== */
     html { -webkit-text-size-adjust: 100%; }
+    /* 화면을 아래로 끌어당겨 새로고침(pull-to-refresh)되는 것을 막습니다.
+       진행 중인 분석이 끊기거나 입력이 사라지지 않게 하기 위함입니다. */
+    html, body { overscroll-behavior-y: none; }
     body {
       font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, sans-serif;
       -webkit-tap-highlight-color: transparent;
@@ -2744,6 +2747,35 @@ Set the new caption in the same font, weight, size and white strip as the other 
         else if (state.lightbox) Actions.closeLightbox();
         else if (state.isAnalyzing) Actions.cancel();
       });
+
+      /* ---------------------------------------------------------
+         당겨서 새로고침 막기 — CSS(overscroll-behavior)를 지원하지 않는 브라우저용 보조 장치
+         페이지 맨 위에서 아래로 끌어당길 때만 막고, 일반 스크롤·확대·
+         안쪽 스크롤 영역(이미지 크게 보기, 입력칸)은 그대로 둡니다.
+         --------------------------------------------------------- */
+      (function blockPullToRefresh() {
+        let startY = 0;
+        let tracking = false;
+        const scrollableParentAtTop = el => {
+          for (let n = el; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+            const st = window.getComputedStyle(n);
+            if (/(auto|scroll)/.test(st.overflowY) && n.scrollHeight > n.clientHeight) return n.scrollTop <= 0;
+          }
+          return true;
+        };
+        document.addEventListener("touchstart", e => {
+          if (e.touches.length !== 1) { tracking = false; return; }
+          startY = e.touches[0].clientY;
+          const pageTop = (window.scrollY || document.documentElement.scrollTop || 0) <= 0;
+          tracking = pageTop && scrollableParentAtTop(e.target);
+        }, { passive: true });
+        document.addEventListener("touchmove", e => {
+          if (!tracking || e.touches.length !== 1) return;
+          const dy = e.touches[0].clientY - startY;
+          if (dy > 0 && e.cancelable) e.preventDefault();
+          else if (dy < 0) tracking = false;
+        }, { passive: false });
+      })();
 
       setInterval(() => { persist(false); }, CONFIG.AUTOSAVE_MS);
       /* 모바일·앱(WebView)은 창을 닫을 때 beforeunload가 오지 않는 경우가 많아
